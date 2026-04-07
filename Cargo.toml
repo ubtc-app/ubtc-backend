@@ -1,0 +1,21 @@
+[package]
+name = "ubtc-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio", "macros", "migrate"] }
+reqwest = { version = "0.12", features = ["json"] }
+rust_decimal = "1"
+rust_decimal_macros = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+dotenvy = "0.15"
