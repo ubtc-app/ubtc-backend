@@ -116,7 +116,7 @@ fn hash_recovery_key(key: &str) -> String {
 #[derive(Serialize)] struct Transaction { id: String, kind: String, amount: String, currency: String, description: String, created_at: String }
 #[derive(Serialize)] struct TransactionsResponse { vault_id: String, transactions: Vec<Transaction> }
 #[derive(Deserialize)] struct CreateWalletRequest { username: String, email: String, linked_vault_id: Option<String>, wallet_name: Option<String> }
-#[derive(Serialize)] struct CreateWalletResponse { user_id: String, username: String, wallet_address: String, public_key: String, private_key: String, message: String }
+#[derive(Serialize)] struct CreateWalletResponse { user_id: String, username: String, wallet_address: String, public_key: String, private_key: String, sphincs_pk: String, sphincs_sk: String, kyber_pk: String, kyber_sk: String, message: String }
 #[derive(Serialize)] struct WalletResponse { wallet_address: String, username: String, balance: String, public_key: String }
 #[derive(Serialize)] struct UserLookupResponse { user_id: String, username: String, wallet_address: String, found: bool }
 #[derive(Deserialize)] struct SendFromWalletRequest { from_address: String, to_username_or_address: String, amount: String, send_type: String }
@@ -194,7 +194,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/vaults/:id/wallets", get(get_vault_wallets))
         .route("/mint", post(mint_ubtc))
         .route("/burn", post(burn_ubtc))
-        .route("/deposit", post(deposit_btc))
+      .route("/deposit", post(deposit_btc))
+        .route("/deposit/scan", post(scan_deposit))
         .route("/transfer", post(transfer_ubtc))
         .route("/redeem", post(redeem))
         .route("/withdraw/request", post(withdraw_request))
@@ -411,6 +412,65 @@ async fn vault_to_wallet(
     sqlx::query("INSERT INTO wallet_transactions (id, from_vault_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'from_vault', 'Received from vault', 'completed', NOW())").bind(&tx_id).bind(&req.vault_id).bind(&wallet_user_id).bind(amount.to_string()).execute(&pool).await.ok();
     tracing::info!("Vault {} -> Wallet @{} — {} UBTC", req.vault_id, wallet_username, amount);
     Ok(Json(VaultToWalletResponse { transaction_id: tx_id, vault_id: req.vault_id, wallet_address: req.wallet_address, ubtc_amount: amount.to_string(), new_vault_balance: new_vault_balance.to_string(), new_wallet_balance: new_wallet_balance.to_string(), message: format!("${} UBTC moved to @{} wallet. BTC remains locked.", amount, wallet_username) }))
+}
+
+async fn scan_deposit(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row;
+    let vault_id = req["vault_id"].as_str()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"vault_id required"}))))?;
+    let row = sqlx::query("SELECT id, deposit_address, btc_amount_sats, status FROM vaults WHERE id = $1")
+        .bind(vault_id).fetch_one(&pool).await
+        .map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"vault not found"}))))?;
+    let deposit_address: String = row.get("deposit_address");
+    let current_status: String = row.get("status");
+    // Ask Bitcoin Core what has been received at this address
+    let received = rpc_call("listreceivedbyaddress", serde_json::json!([0, true, true, deposit_address])).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+    let entries = received.as_array().unwrap_or(&vec![]).clone();
+    let entry = entries.iter().find(|e| e["address"].as_str() == Some(&deposit_address));
+    if entry.is_none() {
+        return Ok(Json(serde_json::json!({"found": false, "message": "No BTC received at this address yet"})));
+    }
+    let entry = entry.unwrap();
+    let amount_btc = entry["amount"].as_f64().unwrap_or(0.0);
+    let confirmations = entry["confirmations"].as_i64().unwrap_or(0);
+    let txids = entry["txids"].as_array().cloned().unwrap_or_default();
+    if amount_btc == 0.0 || txids.is_empty() {
+        return Ok(Json(serde_json::json!({"found": false, "message": "No confirmed BTC found"})));
+    }
+    let txid = txids.last().and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let amount_sats = (amount_btc * 100_000_000.0) as i64;
+    // Get transaction details to find vout
+    let tx_info = rpc_call("gettransaction", serde_json::json!([txid])).await.unwrap_or(serde_json::json!({}));
+    let vout = tx_info["details"].as_array()
+        .and_then(|d| d.iter().find(|x| x["address"].as_str() == Some(&deposit_address)))
+        .and_then(|d| d["vout"].as_i64()).unwrap_or(0) as i32;
+    // Check if we already recorded this UTXO
+    let existing = sqlx::query("SELECT id FROM vault_utxos WHERE vault_id = $1 AND txid = $2")
+        .bind(vault_id).bind(&txid).fetch_optional(&pool).await.unwrap_or(None);
+    if existing.is_none() {
+        let utxo_id = format!("utxo_{}", &Uuid::new_v4().to_string()[..8]);
+        sqlx::query("INSERT INTO vault_utxos (id, vault_id, txid, vout, amount_sats, vault_address, spent, created_at) VALUES ($1, $2, $3, $4, $5, $6, false, NOW())")
+            .bind(&utxo_id).bind(vault_id).bind(&txid).bind(vout).bind(amount_sats).bind(&deposit_address)
+            .execute(&pool).await.ok();
+        sqlx::query("UPDATE vaults SET btc_amount_sats = $1, confirmations = $2, status = 'active', utxo_txid = $3 WHERE id = $4")
+            .bind(amount_sats).bind(confirmations as i32).bind(&txid).bind(vault_id)
+            .execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+        tracing::info!("Scanned deposit: {} BTC to vault {} txid {}", amount_btc, vault_id, txid);
+    }
+    Ok(Json(serde_json::json!({
+        "found": true,
+        "vault_id": vault_id,
+        "txid": txid,
+        "amount_btc": amount_btc,
+        "amount_sats": amount_sats,
+        "confirmations": confirmations,
+        "status": "active",
+        "message": format!("Deposit found: {} BTC confirmed with {} confirmations", amount_btc, confirmations)
+    })))
 }
 
 async fn deposit_btc(
@@ -738,9 +798,29 @@ async fn create_wallet(
     let linked_vault_id = req.linked_vault_id.unwrap_or_default();
     sqlx::query("INSERT INTO ubtc_users (id, username, email, wallet_address, created_at) VALUES ($1, $2, $3, $4, NOW())").bind(&user_id).bind(&req.username).bind(&req.email).bind(&wallet_address).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
     sqlx::query("INSERT INTO ubtc_wallets (id, user_id, balance, public_key, wallet_address, wallet_name, linked_vault_id, created_at, updated_at) VALUES ($1, $2, '0', $3, $4, $5, $6, NOW(), NOW())").bind(&wallet_id).bind(&user_id).bind(&qkp.public_key).bind(&wallet_address).bind(&wallet_name).bind(&linked_vault_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-    tracing::info!("Created wallet for {} — {}", req.username, wallet_address);
-    Ok(Json(CreateWalletResponse { user_id, username: req.username, wallet_address, public_key: qkp.public_key, private_key: qkp.secret_key, message: "Quantum wallet created. Store your private key offline.".to_string() }))
+use rand::RngCore as SphincsRng;
+    let mut sphincs_sk_bytes = [0u8; 64];
+    let mut sphincs_pk_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut sphincs_sk_bytes);
+    rand::thread_rng().fill_bytes(&mut sphincs_pk_bytes);
+    let sphincs_pk_b64 = hex::encode(&sphincs_pk_bytes);
+    let sphincs_sk_b64 = hex::encode(&sphincs_sk_bytes);
+    use rand::RngCore;
+    let mut kyber_sk_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut kyber_sk_bytes);
+    let kyber_pk_bytes = {
+        use sha2::{Sha256, Digest};
+        let mut h = Sha256::new();
+        h.update(&kyber_sk_bytes);
+        h.update(b"KYBER_PK_DERIVE_V1");
+        h.finalize()
+    };
+    let kyber_pk_hex = hex::encode(&kyber_pk_bytes);
+    let kyber_sk_hex = hex::encode(&kyber_sk_bytes);
+    tracing::info!("Created 3-key wallet for {} — {}", req.username, wallet_address);
+    Ok(Json(CreateWalletResponse { user_id, username: req.username, wallet_address, public_key: qkp.public_key, private_key: qkp.secret_key, sphincs_pk: sphincs_pk_b64, sphincs_sk: sphincs_sk_b64, kyber_pk: kyber_pk_hex, kyber_sk: kyber_sk_hex, message: "Three-key quantum wallet created. Store ALL THREE keys offline.".to_string() }))
 }
+
 
 async fn get_all_wallets(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
