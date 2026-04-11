@@ -83,8 +83,6 @@ fn hash_recovery_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 #[derive(Deserialize)] struct CreateVaultRequest { user_pubkey: String, network: Option<String>, recovery_blocks: Option<i32>, account_type: Option<String> }
 #[derive(Serialize)] struct CreateVaultResponse { vault_id: String, deposit_address: String, network: String, recovery_blocks: i32, account_type: String }
 #[derive(Serialize)] struct VaultStatus { vault_id: String, status: String, deposit_address: String, btc_amount_sats: i64, ubtc_minted: String, confirmations: i32, account_type: String }
@@ -95,7 +93,9 @@ fn hash_recovery_key(key: &str) -> String {
 #[derive(Deserialize)] struct DepositRequest { vault_id: String, amount_btc: String }
 #[derive(Serialize)] struct DepositResponse { txid: String, vault_id: String, amount_btc: String, deposit_address: String }
 #[derive(Serialize)] struct DashboardResponse { active_vaults: i64, total_btc_sats: i64, total_ubtc_minted: String, btc_price_usd: String, vaults: Vec<VaultStatus> }
-#[derive(Deserialize)] struct TransferRequest { from_vault_id: String, to_address: String, ubtc_amount: String }
+#[derive(Deserialize)] struct TransferRequest { from_vault_id: String, to_address: String, ubtc_amount: String, pq_signature: Option<String> }
+#[derive(Deserialize)] struct SignPayloadRequest { private_key: String, payload: String }
+#[derive(Serialize)] struct SignPayloadResponse { signature: String }
 #[derive(Serialize)] struct TransferResponse { transfer_id: String, from_vault_id: String, to_address: String, ubtc_amount: String, taproot_placeholder: bool, message: String }
 #[derive(Deserialize)] struct RedeemRequest { vault_id: String, ubtc_to_burn: String, destination_address: String }
 #[derive(Serialize)] struct RedeemResponse { txid: String, vault_id: String, ubtc_burned: String, btc_sent: String, destination_address: String, vault_status: String }
@@ -208,9 +208,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/wallet/lookup/:username", get(lookup_user))
         .route("/wallet/otp/request", post(wallet_otp_request))
         .route("/wallet/otp/verify", post(wallet_otp_verify))
-        .route("/wallet/redeem", post(wallet_redeem))
-       .route("/wallets/all", get(get_all_wallets))
-
+       .route("/wallet/redeem", post(wallet_redeem))
+        .route("/wallet/sign-payload", post(sign_payload))
+        .route("/wallets/all", get(get_all_wallets))
         .route("/wallet/:address/send", post(send_from_wallet))
         .route("/wallet/:address/transactions", get(get_wallet_transactions))
         .route("/stablecoin/deposit", post(stablecoin_deposit))
@@ -409,7 +409,7 @@ async fn vault_to_wallet(
     sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'to_wallet', NOW())").bind(&burn_id).bind(&req.vault_id).bind(amount.to_string()).execute(&pool).await.ok();
     let tx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO wallet_transactions (id, from_vault_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'from_vault', 'Received from vault', 'completed', NOW())").bind(&tx_id).bind(&req.vault_id).bind(&wallet_user_id).bind(amount.to_string()).execute(&pool).await.ok();
-    tracing::info!("Vault {} → Wallet @{} — {} UBTC", req.vault_id, wallet_username, amount);
+    tracing::info!("Vault {} -> Wallet @{} — {} UBTC", req.vault_id, wallet_username, amount);
     Ok(Json(VaultToWalletResponse { transaction_id: tx_id, vault_id: req.vault_id, wallet_address: req.wallet_address, ubtc_amount: amount.to_string(), new_vault_balance: new_vault_balance.to_string(), new_wallet_balance: new_wallet_balance.to_string(), message: format!("${} UBTC moved to @{} wallet. BTC remains locked.", amount, wallet_username) }))
 }
 
@@ -489,16 +489,44 @@ async fn transfer_ubtc(
     let vault_id: String = row.get("id");
     let status: String = row.get("status");
     let ubtc_minted: String = row.get("ubtc_minted");
-    if status != "active" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"vault not active"})))); }
+  if status != "active" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"vault not active"})))); }
     let outstanding = Decimal::from_str(&ubtc_minted).unwrap_or(dec!(0));
     let amount = Decimal::from_str(&req.ubtc_amount).map_err(|_| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid ubtc_amount"}))))?;
     if amount > outstanding { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("amount {} exceeds outstanding {}", amount, outstanding)})))); }
+    // Quantum signature verification
+    let sig = req.pq_signature.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"quantum signature required — sign this transfer with your Quantum Signing Key"}))))?;
+    let payload = format!("{}:{}:{}", vault_id, req.to_address, amount.to_string());
+    if let Ok(wallet_row) = sqlx::query("SELECT public_key FROM ubtc_wallets WHERE linked_vault_id = $1")
+        .bind(&vault_id).fetch_one(&pool).await {
+        use sqlx::Row;
+        let public_key: String = wallet_row.get("public_key");
+        if !quantum_verify(&public_key, payload.as_bytes(), sig) {
+            return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid quantum signature — transfer rejected"}))));
+        }
+        tracing::info!("Quantum signature verified for transfer from vault {}", vault_id);
+    } else {
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"no linked wallet found — link a wallet to this vault to enable quantum-signed transfers"}))));
+    }
     let new_outstanding = outstanding - amount;
     sqlx::query("UPDATE vaults SET ubtc_minted = $1 WHERE id = $2").bind(new_outstanding.to_string()).bind(&vault_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
     let transfer_id = format!("txfr_{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO ubtc_transfers (id, from_vault_id, to_address, ubtc_amount, taproot_placeholder, status, created_at) VALUES ($1, $2, $3, $4, true, 'completed', NOW())").bind(&transfer_id).bind(&vault_id).bind(&req.to_address).bind(amount.to_string()).execute(&pool).await.ok();
     let burn_id = format!("burn_{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'transfer', NOW())").bind(&burn_id).bind(&vault_id).bind(amount.to_string()).execute(&pool).await.ok();
+    // Credit recipient wallet if to_address is a UBTC wallet
+    if let Ok(wallet_row) = sqlx::query("SELECT id, balance, user_id FROM ubtc_wallets WHERE wallet_address = $1")
+        .bind(&req.to_address).fetch_one(&pool).await {
+        let wallet_id: String = wallet_row.get("id");
+        let wallet_balance: String = wallet_row.get("balance");
+        let to_user_id: String = wallet_row.get("user_id");
+        let new_balance = Decimal::from_str(&wallet_balance).unwrap_or(dec!(0)) + amount;
+        sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2")
+            .bind(new_balance.to_string()).bind(&wallet_id).execute(&pool).await.ok();
+        let wtx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
+        sqlx::query("INSERT INTO wallet_transactions (id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'received', 'UBTC received from transfer', 'completed', NOW())")
+            .bind(&wtx_id).bind(&to_user_id).bind(amount.to_string()).execute(&pool).await.ok();
+        tracing::info!("Credited wallet {} with {} UBTC", req.to_address, amount);
+    }
     Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred. BTC vault unchanged.".to_string() }))
 }
 
@@ -516,8 +544,11 @@ async fn redeem(
     let outstanding = Decimal::from_str(&ubtc_minted).unwrap_or(dec!(0));
     let to_burn = Decimal::from_str(&req.ubtc_to_burn).map_err(|_| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid ubtc_to_burn"}))))?;
     if to_burn > outstanding { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("burn {} exceeds outstanding {}", to_burn, outstanding)})))); }
-    let burn_ratio = to_burn / outstanding;
-    let btc_to_release_sats = (Decimal::from(btc_amount_sats) * burn_ratio).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+    // Price-based redemption: redeem exactly $1 of BTC per $1 of UBTC burned
+    // Overcollateral always stays in the vault for the owner
+    let btc_price = fetch_btc_price().await.unwrap_or(dec!(65000));
+    let btc_to_release_sats = ((to_burn / btc_price) * dec!(100_000_000)).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+    let btc_to_release_sats = btc_to_release_sats.min(btc_amount_sats);
     let txid = spend_vault_utxo(&pool, &vault_id, &req.destination_address, btc_to_release_sats).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
     let btc_sent = btc_to_release_sats as f64 / 100_000_000.0;
     let new_outstanding = outstanding - to_burn;
@@ -580,8 +611,10 @@ async fn withdraw_verify(
     let btc_amount_sats: i64 = vault_row.get("btc_amount_sats");
     let outstanding = Decimal::from_str(&ubtc_minted).unwrap_or(dec!(0));
     let to_burn = Decimal::from_str(&ubtc_amount).unwrap_or(dec!(0));
-    let burn_ratio = to_burn / outstanding;
-    let btc_to_release_sats = (Decimal::from(btc_amount_sats) * burn_ratio).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+    // Price-based: release exactly $1 of BTC per $1 of UBTC burned
+    let btc_price = fetch_btc_price().await.unwrap_or(dec!(65000));
+    let btc_to_release_sats = ((to_burn / btc_price) * dec!(100_000_000)).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+    let btc_to_release_sats = btc_to_release_sats.min(btc_amount_sats);
     let txid = spend_vault_utxo(&pool, &vault_id, &destination_address, btc_to_release_sats).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
     let btc_sent = btc_to_release_sats as f64 / 100_000_000.0;
     let new_outstanding = outstanding - to_burn;
@@ -591,7 +624,7 @@ async fn withdraw_verify(
     let burn_id = format!("burn_{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'withdraw', NOW())").bind(&burn_id).bind(&vault_id).bind(to_burn.to_string()).execute(&pool).await.ok();
     tracing::info!("Withdraw {} completed. txid: {}", req.withdraw_id, txid);
-    Ok(Json(WithdrawVerifyResponse { withdraw_id: req.withdraw_id, status: "completed".to_string(), txid: Some(txid), btc_sent: Some(format!("{:.8}", btc_sent)), pq_signature: Some(pq_sig), message: "Withdrawal complete. OTP ✓ Second Key ✓ Quantum Signature ✓".to_string() }))
+    Ok(Json(WithdrawVerifyResponse { withdraw_id: req.withdraw_id, status: "completed".to_string(), txid: Some(txid), btc_sent: Some(format!("{:.8}", btc_sent)), pq_signature: Some(pq_sig), message: "Withdrawal complete. OTP check Second Key check Quantum Signature check".to_string() }))
 }
 
 async fn dashboard(
@@ -674,12 +707,14 @@ async fn recovery_execute(
     if chrono::Utc::now() < available_at { let remaining = available_at - chrono::Utc::now(); return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("time lock: {} hours {} minutes remaining", remaining.num_hours(), remaining.num_minutes() % 60)})))); }
     if hash_recovery_key(&req.recovery_key) != stored_key_hash { return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid recovery key"})))); }
     let vault_row = sqlx::query("SELECT ubtc_minted, btc_amount_sats FROM vaults WHERE id = $1").bind(&vault_id).fetch_one(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-    let ubtc_minted: String = vault_row.get("ubtc_minted");
     let btc_amount_sats: i64 = vault_row.get("btc_amount_sats");
-    let outstanding = Decimal::from_str(&ubtc_minted).unwrap_or(dec!(0));
+    let ubtc_minted_str: String = vault_row.get("ubtc_minted");
+    let outstanding = Decimal::from_str(&ubtc_minted_str).unwrap_or(dec!(0));
     let to_burn = Decimal::from_str(&ubtc_amount).unwrap_or(dec!(0));
-    let burn_ratio = if outstanding > dec!(0) { to_burn / outstanding } else { dec!(1) };
-    let btc_to_release_sats = (Decimal::from(btc_amount_sats) * burn_ratio).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+    // Price-based recovery: release exactly face value in BTC
+    let btc_price = fetch_btc_price().await.unwrap_or(dec!(65000));
+    let btc_to_release_sats = ((to_burn / btc_price) * dec!(100_000_000)).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+    let btc_to_release_sats = btc_to_release_sats.min(btc_amount_sats);
     let txid = spend_vault_utxo(&pool, &vault_id, &destination_address, btc_to_release_sats).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
     let btc_sent = btc_to_release_sats as f64 / 100_000_000.0;
     let new_outstanding = outstanding - to_burn;
@@ -706,31 +741,30 @@ async fn create_wallet(
     tracing::info!("Created wallet for {} — {}", req.username, wallet_address);
     Ok(Json(CreateWalletResponse { user_id, username: req.username, wallet_address, public_key: qkp.public_key, private_key: qkp.secret_key, message: "Quantum wallet created. Store your private key offline.".to_string() }))
 }
+
 async fn get_all_wallets(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT w.id, w.wallet_address, w.balance, w.wallet_name, w.linked_vault_id, u.username
-         FROM ubtc_wallets w
-         JOIN ubtc_users u ON w.user_id = u.id
-         ORDER BY w.created_at DESC"
-    )
-    .fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = sqlx::query("SELECT w.id, w.wallet_address, w.balance, w.uusdt_balance, w.uusdc_balance, w.wallet_name, w.linked_vault_id, u.username FROM ubtc_wallets w JOIN ubtc_users u ON w.user_id = u.id ORDER BY w.created_at DESC")
+        .fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let wallets: Vec<serde_json::Value> = rows.iter().map(|row| {
         let wallet_name: Option<String> = row.try_get("wallet_name").ok().flatten();
         let linked_vault_id: Option<String> = row.try_get("linked_vault_id").ok().flatten();
         serde_json::json!({
             "wallet_id": row.get::<String, _>("id"),
             "wallet_address": row.get::<String, _>("wallet_address"),
-            "balance": row.get::<String, _>("balance"),
+           "balance": row.get::<String, _>("balance"),
+            "uusdt_balance": row.try_get::<String, _>("uusdt_balance").unwrap_or_else(|_| "0".to_string()),
+            "uusdc_balance": row.try_get::<String, _>("uusdc_balance").unwrap_or_else(|_| "0".to_string()),
             "wallet_name": wallet_name.unwrap_or_else(|| "My Wallet".to_string()),
             "linked_vault_id": linked_vault_id.unwrap_or_default(),
             "username": row.get::<String, _>("username"),
         })
     }).collect();
-     Ok(Json(serde_json::json!({ "wallets": wallets })))
+    Ok(Json(serde_json::json!({ "wallets": wallets })))
 }
+
 async fn get_wallet(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     axum::extract::Path(address): axum::extract::Path<String>,
@@ -767,26 +801,29 @@ async fn send_from_wallet(
     let tx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
     let new_sender_balance = sender_balance_dec - amount;
     if req.send_type == "internal" {
-        let recipient = sqlx::query("SELECT w.id, w.balance, u.username FROM ubtc_wallets w JOIN ubtc_users u ON w.user_id = u.id WHERE u.username = $1 OR w.wallet_address = $1").bind(&req.to_username_or_address).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"recipient not found"}))))?;
+        let recipient = sqlx::query("SELECT w.id, w.balance, w.user_id, u.username FROM ubtc_wallets w JOIN ubtc_users u ON w.user_id = u.id WHERE u.username = $1 OR w.wallet_address = $1").bind(&req.to_username_or_address).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"recipient not found"}))))?;
         let recipient_wallet_id: String = recipient.get("id");
         let recipient_balance: String = recipient.get("balance");
         let recipient_username: String = recipient.get("username");
+        let recipient_user_id: String = recipient.get("user_id");
         let new_recipient_balance = Decimal::from_str(&recipient_balance).unwrap_or(dec!(0)) + amount;
         sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2").bind(new_sender_balance.to_string()).bind(&sender_wallet_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
         sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2").bind(new_recipient_balance.to_string()).bind(&recipient_wallet_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-        sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'internal', 'Internal UBTC transfer', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(recipient.get::<String, _>("user_id")).bind(amount.to_string()).execute(&pool).await.ok();
+        sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'internal', 'Internal UBTC transfer', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(&recipient_user_id).bind(amount.to_string()).execute(&pool).await.ok();
         Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. BTC collateral unchanged.".to_string() }))
     } else {
         if linked_vault_id.is_empty() { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No linked vault. External sends require a vault-linked wallet."})))); }
         let vault_row = sqlx::query("SELECT ubtc_minted, btc_amount_sats, status FROM vaults WHERE id = $1").bind(&linked_vault_id).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"linked vault not found"}))))?;
-        let vault_ubtc: String = vault_row.get("ubtc_minted");
         let vault_btc_sats: i64 = vault_row.get("btc_amount_sats");
         let vault_status: String = vault_row.get("status");
+        let vault_ubtc: String = vault_row.get("ubtc_minted");
         if vault_status != "active" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"linked vault not active"})))); }
         let vault_ubtc_dec = Decimal::from_str(&vault_ubtc).unwrap_or(dec!(0));
         if vault_ubtc_dec == dec!(0) { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"no UBTC outstanding in linked vault"})))); }
-        let burn_ratio = amount / vault_ubtc_dec;
-        let btc_to_release_sats = (Decimal::from(vault_btc_sats) * burn_ratio).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+        // Price-based: release exactly face value in BTC
+        let btc_price = fetch_btc_price().await.unwrap_or(dec!(65000));
+        let btc_to_release_sats = ((amount / btc_price) * dec!(100_000_000)).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+        let btc_to_release_sats = btc_to_release_sats.min(vault_btc_sats);
         let _txid = spend_vault_utxo(&pool, &linked_vault_id, &req.to_username_or_address, btc_to_release_sats).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
         let btc_sent = btc_to_release_sats as f64 / 100_000_000.0;
         let new_vault_ubtc = vault_ubtc_dec - amount;
@@ -795,7 +832,7 @@ async fn send_from_wallet(
         sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2").bind(new_sender_balance.to_string()).bind(&sender_wallet_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
         let burn_id = format!("burn_{}", &Uuid::new_v4().to_string()[..8]);
         sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'external_send', NOW())").bind(&burn_id).bind(&linked_vault_id).bind(amount.to_string()).execute(&pool).await.ok();
-        sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'external', 'External send — BTC released from vault', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(amount.to_string()).execute(&pool).await.ok();
+        sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'external', 'External send', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(amount.to_string()).execute(&pool).await.ok();
         tracing::info!("External wallet send — {} UBTC + {} BTC to {}", amount, btc_sent, req.to_username_or_address);
         Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: req.to_username_or_address, amount: amount.to_string(), send_type: "external".to_string(), message: format!("${} UBTC sent. {} BTC released from vault.", amount, btc_sent) }))
     }
@@ -865,7 +902,15 @@ async fn wallet_otp_verify(
     let pq_sig = quantum_sign(&pq_secret_key, message.as_bytes()).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"quantum signing failed"}))))?;
     sqlx::query("UPDATE transfer_requests SET status = 'completed', verified_at = NOW(), pq_signature = $1 WHERE id = $2").bind(&pq_sig).bind(&req.otp_id).execute(&pool).await.ok();
     tracing::info!("Wallet OTP {} verified", req.otp_id);
-    Ok(Json(WalletOtpVerifyResponse { verified: true, pq_signature: pq_sig, message: "OTP ✓ Second Key ✓ Quantum Signature ✓".to_string() }))
+    Ok(Json(WalletOtpVerifyResponse { verified: true, pq_signature: pq_sig, message: "OTP check Second Key check Quantum Signature check".to_string() }))
+}
+
+async fn sign_payload(
+    Json(req): Json<SignPayloadRequest>,
+) -> Result<Json<SignPayloadResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let sig = quantum_sign(&req.private_key, req.payload.as_bytes())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "signing failed — invalid private key"}))))?;
+    Ok(Json(SignPayloadResponse { signature: sig }))
 }
 
 async fn wallet_redeem(
@@ -892,8 +937,10 @@ async fn wallet_redeem(
     if vault_status != "active" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"linked vault not active"})))); }
     let vault_ubtc_dec = Decimal::from_str(&vault_ubtc).unwrap_or(dec!(0));
     if vault_ubtc_dec == dec!(0) { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"no UBTC outstanding in linked vault"})))); }
-    let burn_ratio = amount / vault_ubtc_dec;
-    let btc_to_release_sats = (Decimal::from(vault_btc_sats) * burn_ratio).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+    // Price-based: release exactly face value in BTC, overcollateral stays in vault
+    let btc_price = fetch_btc_price().await.unwrap_or(dec!(65000));
+    let btc_to_release_sats = ((amount / btc_price) * dec!(100_000_000)).to_string().parse::<f64>().unwrap_or(0.0) as i64;
+    let btc_to_release_sats = btc_to_release_sats.min(vault_btc_sats);
     let txid = spend_vault_utxo(&pool, &linked_vault_id, &req.destination_btc_address, btc_to_release_sats).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
     let btc_sent = btc_to_release_sats as f64 / 100_000_000.0;
     let new_wallet_balance = balance_dec - amount;
@@ -905,7 +952,7 @@ async fn wallet_redeem(
     sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'wallet_redeem', NOW())").bind(&burn_id).bind(&linked_vault_id).bind(amount.to_string()).execute(&pool).await.ok();
     let tx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'redeem', 'UBTC Redeemed for BTC', 'completed', NOW())").bind(&tx_id).bind(wallet_row.get::<String, _>("user_id")).bind(amount.to_string()).execute(&pool).await.ok();
-    tracing::info!("Wallet redeem @{} — {} UBTC → {} BTC txid: {}", username, amount, btc_sent, txid);
+    tracing::info!("Wallet redeem @{} — {} UBTC -> {} BTC txid: {}", username, amount, btc_sent, txid);
     Ok(Json(WalletRedeemResponse { txid, wallet_address: req.wallet_address, ubtc_burned: amount.to_string(), btc_sent: format!("{:.8}", btc_sent), destination_btc_address: req.destination_btc_address, message: format!("${} UBTC redeemed. {} BTC sent to your Bitcoin address.", amount, btc_sent) }))
 }
 
@@ -913,17 +960,32 @@ async fn stablecoin_deposit(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     Json(req): Json<StablecoinDepositRequest>,
 ) -> Result<Json<StablecoinDepositResponse>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row;
     let currency = req.currency.to_uppercase();
     if currency != "UUSDT" && currency != "UUSDC" {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "currency must be UUSDT or UUSDC"}))));
     }
     let amount = Decimal::from_str(&req.amount).map_err(|_| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid amount"}))))?;
     if amount <= dec!(0) { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "amount must be positive"})))); }
-    let vault_id = format!("sc_{}", &Uuid::new_v4().to_string()[..8]);
     let account_type = req.account_type.unwrap_or_else(|| "current".to_string());
-    sqlx::query("INSERT INTO stablecoin_vaults (id, currency, balance, deposited_amount, account_type, status, created_at, updated_at) VALUES ($1, $2, '0', $3, $4, 'active', NOW(), NOW())")
-        .bind(&vault_id).bind(&currency).bind(amount.to_string()).bind(&account_type)
-        .execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    // Check if a vault already exists for this currency + account_type — top it up instead of creating new
+    let existing_sc = sqlx::query("SELECT id, deposited_amount FROM stablecoin_vaults WHERE currency = $1 AND account_type = $2 AND status = 'active' ORDER BY created_at ASC LIMIT 1")
+        .bind(&currency).bind(&account_type).fetch_optional(&pool).await.unwrap_or(None);
+    let vault_id = if let Some(ex_row) = existing_sc {
+        let ex_id: String = ex_row.get("id");
+        let ex_dep: String = ex_row.get("deposited_amount");
+        let new_dep = Decimal::from_str(&ex_dep).unwrap_or(dec!(0)) + amount;
+        sqlx::query("UPDATE stablecoin_vaults SET deposited_amount = $1, updated_at = NOW() WHERE id = $2")
+            .bind(new_dep.to_string()).bind(&ex_id).execute(&pool)
+            .await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+        ex_id
+    } else {
+        let new_id = format!("sc_{}", &Uuid::new_v4().to_string()[..8]);
+        sqlx::query("INSERT INTO stablecoin_vaults (id, currency, balance, deposited_amount, account_type, status, created_at, updated_at) VALUES ($1, $2, '0', $3, $4, 'active', NOW(), NOW())")
+            .bind(&new_id).bind(&currency).bind(amount.to_string()).bind(&account_type)
+            .execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+        new_id
+    };
     let tx_id = format!("sctx_{}", &Uuid::new_v4().to_string()[..8]);
     let underlying = if currency == "UUSDT" { "USDT" } else { "USDC" };
     sqlx::query("INSERT INTO stablecoin_transactions (id, vault_id, kind, amount, currency, description, created_at) VALUES ($1, $2, 'deposit', $3, $4, $5, NOW())")
@@ -973,7 +1035,7 @@ async fn stablecoin_mint(
     Ok(Json(StablecoinMintResponse {
         mint_id, vault_id: req.vault_id, currency: currency.clone(),
         minted: amount.to_string(), deposited: deposited_dec.to_string(),
-        message: format!("${} {} minted 1:1 against locked {}. Now Bitcoin-native and quantum-resistant. Compatible with all UBTC features — yield, transfers, Taproot Assets.", amount, currency, underlying),
+        message: format!("${} {} minted 1:1 against locked {}.", amount, currency, underlying),
     }))
 }
 
@@ -1034,11 +1096,54 @@ async fn stablecoin_transfer(
         .bind(&transfer_id).bind(&req.from_vault_id).bind(amount.to_string()).bind(&currency)
         .bind(format!("{} transferred — quantum signature verified", currency))
         .execute(&pool).await.ok();
-    tracing::info!("Transfer {} {} to {}", amount, currency, req.to_address);
+   // Credit recipient wallet if to_address is a UBTC wallet
+    if let Ok(wallet_row) = sqlx::query("SELECT id, user_id, uusdt_balance, uusdc_balance FROM ubtc_wallets WHERE wallet_address = $1")
+        .bind(&req.to_address).fetch_one(&pool).await {
+        let wallet_id: String = wallet_row.get("id");
+        let to_user_id: String = wallet_row.get("user_id");
+        if currency == "UUSDT" {
+            let bal: String = wallet_row.get("uusdt_balance");
+            let new_bal = Decimal::from_str(&bal).unwrap_or(dec!(0)) + amount;
+            sqlx::query("UPDATE ubtc_wallets SET uusdt_balance = $1, updated_at = NOW() WHERE id = $2")
+                .bind(new_bal.to_string()).bind(&wallet_id).execute(&pool).await.ok();
+        } else {
+            let bal: String = wallet_row.get("uusdc_balance");
+            let new_bal = Decimal::from_str(&bal).unwrap_or(dec!(0)) + amount;
+            sqlx::query("UPDATE ubtc_wallets SET uusdc_balance = $1, updated_at = NOW() WHERE id = $2")
+                .bind(new_bal.to_string()).bind(&wallet_id).execute(&pool).await.ok();
+        }
+        let wtx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
+        sqlx::query("INSERT INTO wallet_transactions (id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'received', $4, 'completed', NOW())")
+            .bind(&wtx_id).bind(&to_user_id).bind(amount.to_string())
+            .bind(format!("{} received from transfer", currency)).execute(&pool).await.ok();
+        tracing::info!("Credited wallet {} with {} {}", req.to_address, amount, currency);
+    }
+    if let Ok(wallet_row) = sqlx::query("SELECT id, user_id, uusdt_balance, uusdc_balance FROM ubtc_wallets WHERE wallet_address = $1")
+        .bind(&req.to_address).fetch_one(&pool).await {
+        use sqlx::Row;
+        let wallet_id: String = wallet_row.get("id");
+        let to_user_id: String = wallet_row.get("user_id");
+        if currency == "UUSDT" {
+            let bal: String = wallet_row.get("uusdt_balance");
+            let new_bal = Decimal::from_str(&bal).unwrap_or(dec!(0)) + amount;
+            sqlx::query("UPDATE ubtc_wallets SET uusdt_balance = $1, updated_at = NOW() WHERE id = $2")
+                .bind(new_bal.to_string()).bind(&wallet_id).execute(&pool).await.ok();
+        } else {
+            let bal: String = wallet_row.get("uusdc_balance");
+            let new_bal = Decimal::from_str(&bal).unwrap_or(dec!(0)) + amount;
+            sqlx::query("UPDATE ubtc_wallets SET uusdc_balance = $1, updated_at = NOW() WHERE id = $2")
+                .bind(new_bal.to_string()).bind(&wallet_id).execute(&pool).await.ok();
+        }
+        let wtx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
+        sqlx::query("INSERT INTO wallet_transactions (id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'received', $4, 'completed', NOW())")
+            .bind(&wtx_id).bind(&to_user_id).bind(amount.to_string())
+            .bind(format!("{} received from transfer", currency)).execute(&pool).await.ok();
+    }
+	tracing::info!("Transfer {} {} to {}", amount, currency, req.to_address);
     Ok(Json(StablecoinTransferResponse {
         transfer_id, from_vault_id: req.from_vault_id,
         currency: currency.clone(), amount: amount.to_string(),
-        message: format!("${} {} transferred with quantum signature. Underlying {} stays locked in vault.", amount, currency, underlying),
+        message: format!("${} {} transferred. Underlying {} stays locked in vault.", amount, currency, underlying),
     }))
 }
 
@@ -1083,7 +1188,7 @@ async fn get_all_stablecoins(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
-    let rows = sqlx::query("SELECT id, currency, balance, deposited_amount, account_type, status, created_at FROM stablecoin_vaults ORDER BY created_at DESC")
+    let rows = sqlx::query("SELECT id, currency, balance, deposited_amount, account_type, status, created_at FROM stablecoin_vaults WHERE status != 'archived' ORDER BY created_at DESC")
         .fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let vaults: Vec<serde_json::Value> = rows.iter().map(|row| {
         let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
