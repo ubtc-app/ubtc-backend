@@ -1136,11 +1136,79 @@ async fn spend_nullifier(
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let nullifier = req["nullifier"].as_str().ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"nullifier required"}))))?;
+    // Store nullifier in database
     sqlx::query("INSERT INTO nullifiers (id, nullifier_hex, spent_at) VALUES ($1, $2, NOW()) ON CONFLICT (nullifier_hex) DO NOTHING")
         .bind(format!("null_{}", &uuid::Uuid::new_v4().to_string()[..8])).bind(nullifier)
         .execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    // Post nullifier batch to Bitcoin via OP_RETURN
+    let post_to_bitcoin = req["post_to_bitcoin"].as_bool().unwrap_or(true);
+    let mut bitcoin_txid: Option<String> = None;
+    if post_to_bitcoin {
+        // Build OP_RETURN payload: "UBTCN1:" + nullifier_hex (first 32 bytes)
+        let null_bytes = hex::decode(nullifier).unwrap_or_else(|_| nullifier.as_bytes().to_vec());
+        let mut payload = b"UBTCN1:".to_vec();
+        payload.extend_from_slice(&null_bytes[..null_bytes.len().min(32)]);
+        let payload_hex = hex::encode(&payload);
+        // Create OP_RETURN transaction
+        let (rpc_url, rpc_user, rpc_pass) = get_rpc();
+        let client = reqwest::Client::new();
+        // Create raw tx with OP_RETURN
+        let create_res = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+            .json(&serde_json::json!({"jsonrpc":"1.0","method":"createrawtransaction","params":[[],{"data": payload_hex}]}))
+            .send().await;
+        if let Ok(res) = create_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(raw_tx) = data["result"].as_str() {
+                    // Fund the transaction
+                    let fund_res = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+                        .json(&serde_json::json!({"jsonrpc":"1.0","method":"fundrawtransaction","params":[raw_tx]}))
+                        .send().await;
+                    if let Ok(fund_data) = fund_res {
+                        if let Ok(fd) = fund_data.json::<serde_json::Value>().await {
+                            if let Some(funded_hex) = fd["result"]["hex"].as_str() {
+                                // Sign
+                                let sign_res = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+                                    .json(&serde_json::json!({"jsonrpc":"1.0","method":"signrawtransactionwithwallet","params":[funded_hex]}))
+                                    .send().await;
+                                if let Ok(sign_data) = sign_res {
+                                    if let Ok(sd) = sign_data.json::<serde_json::Value>().await {
+                                        if let Some(signed_hex) = sd["result"]["hex"].as_str() {
+                                            // Broadcast
+                                            let send_res = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+                                                .json(&serde_json::json!({"jsonrpc":"1.0","method":"sendrawtransaction","params":[signed_hex]}))
+                                                .send().await;
+                                            if let Ok(send_data) = send_res {
+                                                if let Ok(txdata) = send_data.json::<serde_json::Value>().await {
+                                                    if let Some(txid) = txdata["result"].as_str() {
+                                                        bitcoin_txid = Some(txid.to_string());
+                                                        // Update nullifier with bitcoin txid
+                                                        sqlx::query("UPDATE nullifiers SET bitcoin_txid = $1 WHERE nullifier_hex = $2")
+                                                            .bind(txid).bind(nullifier).execute(&pool).await.ok();
+                                                        tracing::info!("Nullifier posted to Bitcoin! txid: {}", txid);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     tracing::info!("Nullifier spent: {}", &nullifier[..16.min(nullifier.len())]);
-    Ok(Json(serde_json::json!({"nullifier": nullifier, "spent": true, "message": "Nullifier recorded. Double-spend protection active."})))
+    Ok(Json(serde_json::json!({
+        "nullifier": nullifier,
+        "spent": true,
+        "bitcoin_txid": bitcoin_txid,
+        "message": if bitcoin_txid.is_some() {
+            "Nullifier recorded AND posted to Bitcoin testnet4 via OP_RETURN. Double-spend prevention is now on-chain."
+        } else {
+            "Nullifier recorded in database. Bitcoin posting skipped or failed."
+        }
+    })))
 }
 
 async fn check_nullifier(
