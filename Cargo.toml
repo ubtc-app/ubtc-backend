@@ -22,7 +22,9 @@ totp-rs = { version = "5", features = ["gen_secret"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 pqcrypto-dilithium = "0.5"
+pqcrypto-sphincsplus = "0.6"
 pqcrypto-traits = "0.3"
 base64 = "0.21"
 hex = "0.4"
 sha2 = "0.10"
+ubtc-protocol = { path = "../../ubtc-protocol" }
