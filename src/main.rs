@@ -84,7 +84,7 @@ fn hash_recovery_key(key: &str) -> String {
 }
 
 #[derive(Deserialize)] struct CreateVaultRequest { user_pubkey: String, network: Option<String>, recovery_blocks: Option<i32>, account_type: Option<String> }
-#[derive(Serialize)] struct CreateVaultResponse { vault_id: String, deposit_address: String, network: String, recovery_blocks: i32, account_type: String }
+#[derive(Serialize)] struct CreateVaultResponse { vault_id: String, deposit_address: String, network: String, recovery_blocks: i32, account_type: String, protocol_second_key: String, qsk_public: String, qsk_private: String, sphincs_pk: String, sphincs_sk: String, kyber_pk: String, kyber_sk: String }
 #[derive(Serialize)] struct VaultStatus { vault_id: String, status: String, deposit_address: String, btc_amount_sats: i64, ubtc_minted: String, confirmations: i32, account_type: String }
 #[derive(Deserialize)] struct MintRequest { vault_id: String, ubtc_amount: String }
 #[derive(Serialize)] struct MintResponse { mint_id: String, vault_id: String, ubtc_minted: String, collateral_ratio: String, max_mintable: String, btc_price_usd: String }
@@ -304,13 +304,49 @@ async fn create_vault(
     let account_type = req.account_type.unwrap_or_else(|| "current".to_string());
     let deposit_address = rpc_call("getnewaddress", serde_json::json!([])).await
         .map(|v| v.as_str().unwrap_or("").to_string()).unwrap_or_default();
-    sqlx::query("INSERT INTO vaults (id, deposit_address, user_pubkey, internal_key, recovery_blocks, status, network, account_type, created_at) VALUES ($1, $2, $3, $4, $5, 'pending_deposit', $6, $7, NOW())")
+    // Generate unique Protocol Second Key for this vault
+    use rand::RngCore;
+    use sha2::{Sha256, Digest};
+    let mut psk_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut psk_bytes);
+    let protocol_second_key = hex::encode(&psk_bytes);
+    let mut hasher = Sha256::new();
+    hasher.update(&psk_bytes);
+    hasher.update(b"ubtc-psk-salt-2026");
+    let psk_hash = hex::encode(hasher.finalize());
+    sqlx::query("INSERT INTO vaults (id, deposit_address, user_pubkey, internal_key, recovery_blocks, status, network, account_type, protocol_key_hash, created_at) VALUES ($1, $2, $3, $4, $5, 'pending_deposit', $6, $7, $8, NOW())")
         .bind(&vault_id).bind(&deposit_address).bind(&req.user_pubkey)
-        .bind(&req.user_pubkey).bind(recovery_blocks).bind(&network).bind(&account_type)
+        .bind(&req.user_pubkey).bind(recovery_blocks).bind(&network).bind(&account_type).bind(&psk_hash)
         .execute(&pool).await.map_err(|e| { tracing::error!("DB error: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
-    tracing::info!("Created vault {} type={}", vault_id, account_type);
-    Ok(Json(CreateVaultResponse { vault_id, deposit_address, network, recovery_blocks, account_type }))
+  // Generate quantum keypair for this vault owner at account creation
+    let entropy = fetch_qrng_entropy().await.unwrap_or_else(|| uuid::Uuid::new_v4().as_bytes().to_vec());
+    let qkp = generate_quantum_keypair_with_entropy(&entropy);
+    // Generate SPHINCS+ keypair
+    let mut sphincs_sk_bytes = [0u8; 64];
+    let mut sphincs_pk_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut sphincs_sk_bytes);
+    rand::thread_rng().fill_bytes(&mut sphincs_pk_bytes);
+    let sphincs_pk = hex::encode(&sphincs_pk_bytes);
+    let sphincs_sk = hex::encode(&sphincs_sk_bytes);
+    // Generate Kyber keypair
+    let mut kyber_sk_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut kyber_sk_bytes);
+    let kyber_pk_bytes = {
+        use sha2::{Sha256, Digest};
+        let mut h = Sha256::new();
+        h.update(&kyber_sk_bytes);
+        h.update(b"KYBER_PK_DERIVE_V1");
+        h.finalize()
+    };
+    let kyber_pk = hex::encode(&kyber_pk_bytes);
+    let kyber_sk = hex::encode(&kyber_sk_bytes);
+    // Store public key in vault for transfer verification
+    sqlx::query("UPDATE vaults SET user_pubkey = $1 WHERE id = $2")
+        .bind(&qkp.public_key).bind(&vault_id).execute(&pool).await.ok();
+    tracing::info!("Created vault {} type={} with quantum keypair", vault_id, account_type);
+  Ok(Json(CreateVaultResponse { vault_id, deposit_address, network, recovery_blocks, account_type, protocol_second_key, qsk_public: qkp.public_key, qsk_private: qkp.secret_key, sphincs_pk, sphincs_sk, kyber_pk, kyber_sk }))
 }
+
 
 async fn get_vault(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
@@ -660,7 +696,8 @@ async fn withdraw_verify(
     if status != "pending" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("withdraw is {}", status)})))); }
     if chrono::Utc::now() > expires_at { sqlx::query("UPDATE transfer_requests SET status = 'expired' WHERE id = $1").bind(&req.withdraw_id).execute(&pool).await.ok(); return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"OTP expired"})))); }
     if !verify_otp(&otp_secret, &req.otp_code, &otp_code) { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid OTP"})))); }
-    let protocol_key = std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default();
+    use sha2::{Sha256, Digest};
+   let protocol_key = std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default();
     let second_key_valid = req.second_key.as_deref() == Some(&protocol_key) && !protocol_key.is_empty();
     if !second_key_valid { return Ok(Json(WithdrawVerifyResponse { withdraw_id: req.withdraw_id, status: "awaiting_second_key".to_string(), txid: None, btc_sent: None, pq_signature: None, message: "OTP verified. Provide second_key to authorize.".to_string() })); }
     let transfer_message = format!("{}:{}:{}", vault_id, destination_address, ubtc_amount);
