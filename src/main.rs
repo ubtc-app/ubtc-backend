@@ -283,7 +283,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/ubtc/co-sign", post(cosign_transfer))
         .route("/ubtc/nullifier/spend", post(spend_nullifier))
         .route("/ubtc/nullifier/:hex", get(check_nullifier))
-        .route("/ubtc/redeem-proof", post(redeem_proof))
+      .route("/ubtc/redeem-proof", post(redeem_proof))
+        .route("/ubtc/redeem", post(redeem_ubtc))
         .route("/stablecoin/deposit", post(stablecoin_deposit))
         .route("/stablecoin/mint", post(stablecoin_mint))
         .route("/stablecoin/burn", post(stablecoin_burn))
@@ -1423,6 +1424,264 @@ async fn redeem_proof(
         "destination": destination,
         "message": "Proof verified. Use your Kyber key to decrypt the embedded redemption transaction and broadcast to Bitcoin."
     })))
+}
+
+async fn redeem_ubtc(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row;
+    let err = |msg: &str| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+
+    // Required fields
+    let vault_id = req["vault_id"].as_str().ok_or_else(|| err("vault_id required"))?;
+    let ubtc_amount: f64 = req["ubtc_amount"].as_f64().ok_or_else(|| err("ubtc_amount required"))?;
+    let destination = req["destination_address"].as_str().ok_or_else(|| err("destination_address required"))?;
+    let qsk = req["qsk"].as_str().ok_or_else(|| err("qsk required"))?;
+
+    if ubtc_amount <= 0.0 { return Err(err("amount must be positive")); }
+
+    // Load vault
+    let vault_row = sqlx::query(
+        "SELECT id, status, btc_amount_sats, ubtc_minted, deposit_address, mast_address, taproot_secret_key, user_pubkey FROM vaults WHERE id = $1"
+    ).bind(vault_id).fetch_one(&pool).await
+        .map_err(|_| err("vault not found"))?;
+
+    let status: String = vault_row.get("status");
+    if status != "active" { return Err(err("vault not active")); }
+
+    let btc_amount_sats: i64 = vault_row.get("btc_amount_sats");
+    let ubtc_minted_str: String = vault_row.get("ubtc_minted");
+    let ubtc_minted: f64 = ubtc_minted_str.parse().unwrap_or(0.0);
+    let user_pubkey: String = vault_row.get("user_pubkey");
+    let taproot_secret_key: Option<String> = vault_row.try_get("taproot_secret_key").unwrap_or(None);
+    let deposit_address: String = vault_row.get("deposit_address");
+
+    if ubtc_amount > ubtc_minted {
+        return Err(err("cannot redeem more UBTC than minted"));
+    }
+
+   // Verify QSK — sign the redemption message and verify against stored public key
+    let message = format!("redeem:{}:{}:{}", vault_id, ubtc_amount, destination);
+    let signature = quantum_sign(qsk, message.as_bytes());
+    let qsk_valid = if let Some(ref sig) = signature {
+        quantum_verify(&user_pubkey, message.as_bytes(), sig)
+    } else {
+        false
+    };
+    if !qsk_valid {
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid quantum signing key"}))));
+    }
+
+    // Get BTC price
+  use rust_decimal::prelude::ToPrimitive; let btc_price = fetch_btc_price().await.map(|p| p.to_f64().unwrap_or(70000.0)).unwrap_or(70000.0);
+
+    // Calculate BTC to release
+    let btc_to_release_usd = ubtc_amount;
+    let btc_to_release_sats = ((btc_to_release_usd / btc_price) * 100_000_000.0) as i64;
+
+    // Check collateral ratio after redemption
+    let remaining_ubtc = ubtc_minted - ubtc_amount;
+    let remaining_btc_sats = btc_amount_sats - btc_to_release_sats;
+    let remaining_btc_usd = (remaining_btc_sats as f64 / 100_000_000.0) * btc_price;
+
+    if remaining_ubtc > 0.0 {
+        let ratio_after = remaining_btc_usd / remaining_ubtc;
+        if ratio_after < 1.10 {
+            return Err(err("redemption would put vault below liquidation threshold"));
+        }
+    }
+
+    // Load the vault UTXO
+    let utxo_row = sqlx::query(
+        "SELECT id, txid, vout, amount_sats FROM vault_utxos WHERE vault_id = $1 AND spent = false ORDER BY created_at DESC LIMIT 1"
+    ).bind(vault_id).fetch_optional(&pool).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+
+    let redeem_id = format!("rdm_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    if let Some(utxo) = utxo_row {
+        let utxo_id: String = utxo.get("id");
+        let utxo_txid: String = utxo.get("txid");
+        let utxo_vout: i32 = utxo.get("vout");
+        let utxo_amount_sats: i64 = utxo.get("amount_sats");
+
+        // Construct and broadcast Bitcoin transaction using taproot_secret_key
+        let btc_txid = if let Some(ref secret_key_hex) = taproot_secret_key {
+            construct_and_broadcast_redemption(
+                secret_key_hex,
+                &utxo_txid,
+                utxo_vout as u32,
+                utxo_amount_sats as u64,
+                btc_to_release_sats as u64,
+                destination,
+            ).await
+        } else {
+            // Fallback — use Bitcoin Core to send from deposit address
+            let send_amount = btc_to_release_sats as f64 / 100_000_000.0;
+            rpc_call("sendtoaddress", serde_json::json!([destination, send_amount]))
+                .await.ok().and_then(|v| v.as_str().map(|s| s.to_string()))
+        };
+
+        if let Some(ref txid) = btc_txid {
+            // Update vault
+            sqlx::query("UPDATE vaults SET ubtc_minted = $1, btc_amount_sats = $2 WHERE id = $3")
+                .bind((ubtc_minted - ubtc_amount).to_string())
+                .bind(remaining_btc_sats)
+                .bind(vault_id)
+                .execute(&pool).await.ok();
+
+            // Mark UTXO as spent if fully redeemed
+            if remaining_ubtc == 0.0 {
+                sqlx::query("UPDATE vault_utxos SET spent = true, spent_txid = $1 WHERE id = $2")
+                    .bind(txid).bind(&utxo_id).execute(&pool).await.ok();
+            }
+
+            // Post nullifier to Bitcoin
+            let nullifier = format!("redeem{}{}{}", vault_id, ubtc_amount, destination);
+          use sha2::Digest; let null_hex = hex::encode(sha2::Sha256::digest(nullifier.as_bytes()));
+            let _ = rpc_call("ubtc/nullifier/spend", serde_json::json!({"nullifier": null_hex})).await;
+
+            tracing::info!("Redeemed {} UBTC from vault {} — BTC txid: {}", ubtc_amount, vault_id, txid);
+
+            return Ok(Json(serde_json::json!({
+                "redeem_id": redeem_id,
+                "vault_id": vault_id,
+                "ubtc_burned": ubtc_amount,
+                "btc_released_sats": btc_to_release_sats,
+                "btc_released_btc": btc_to_release_sats as f64 / 100_000_000.0,
+                "destination": destination,
+                "bitcoin_txid": txid,
+                "remaining_ubtc": remaining_ubtc,
+                "status": "completed",
+                "message": format!("Redeemed {} UBTC — {} BTC sent to {}", ubtc_amount, btc_to_release_sats as f64 / 100_000_000.0, destination)
+            })));
+        }
+    }
+
+    // No UTXO found — use Bitcoin Core sendtoaddress as fallback
+    let send_amount = btc_to_release_sats as f64 / 100_000_000.0;
+    let btc_txid = rpc_call("sendtoaddress", serde_json::json!([destination, send_amount])).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Bitcoin send failed: {}", e)}))))?;
+    let txid = btc_txid.as_str().unwrap_or("").to_string();
+
+    sqlx::query("UPDATE vaults SET ubtc_minted = $1, btc_amount_sats = $2 WHERE id = $3")
+        .bind((ubtc_minted - ubtc_amount).to_string())
+        .bind(remaining_btc_sats)
+        .bind(vault_id)
+        .execute(&pool).await.ok();
+
+    tracing::info!("Redeemed {} UBTC from vault {} (fallback) — txid: {}", ubtc_amount, vault_id, txid);
+
+    Ok(Json(serde_json::json!({
+        "redeem_id": redeem_id,
+        "vault_id": vault_id,
+        "ubtc_burned": ubtc_amount,
+        "btc_released_sats": btc_to_release_sats,
+        "btc_released_btc": send_amount,
+        "destination": destination,
+        "bitcoin_txid": txid,
+        "remaining_ubtc": remaining_ubtc,
+        "status": "completed",
+        "message": format!("Redeemed {} UBTC — {} BTC sent to {}", ubtc_amount, send_amount, destination)
+    })))
+}
+
+async fn construct_and_broadcast_redemption(
+    secret_key_hex: &str,
+    utxo_txid: &str,
+    utxo_vout: u32,
+    utxo_amount_sats: u64,
+    release_sats: u64,
+    destination: &str,
+) -> Option<String> {
+    use bitcoin::{
+        secp256k1::{Secp256k1, SecretKey},
+        Transaction, TxIn, TxOut, OutPoint, Txid,
+        script::Builder,
+        taproot::TaprootSpendInfo,
+        Address, Network as BtcNetwork,
+        absolute::LockTime,
+        transaction::Version,
+        Amount, ScriptBuf,
+    };
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let secret_key_bytes = hex::decode(secret_key_hex).ok()?;
+    let secret_key = SecretKey::from_slice(&secret_key_bytes).ok()?;
+
+    // Parse destination address
+    let dest_addr = Address::from_str(destination).ok()?.assume_checked();
+
+    // Parse UTXO
+    let txid = Txid::from_str(utxo_txid).ok()?;
+    let outpoint = OutPoint { txid, vout: utxo_vout };
+
+    // Fee estimate — 200 sats/vbyte × ~150 vbytes = 30000 sats
+    let fee_sats = 30000u64;
+    let output_sats = release_sats.saturating_sub(fee_sats);
+
+    if output_sats == 0 { return None; }
+
+    // Build transaction
+    let tx_in = TxIn {
+        previous_output: outpoint,
+        script_sig: ScriptBuf::new(),
+        sequence: bitcoin::Sequence::MAX,
+        witness: bitcoin::Witness::new(),
+    };
+
+    let tx_out = TxOut {
+        value: Amount::from_sat(output_sats),
+        script_pubkey: dest_addr.script_pubkey(),
+    };
+
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![tx_in],
+        output: vec![tx_out],
+    };
+
+    // Sign with Taproot key path spend
+    let pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+    let (xonly, _) = pubkey.x_only_public_key();
+
+    use bitcoin::sighash::{SighashCache, TapSighashType};
+    use bitcoin::taproot::LeafVersion;
+
+    let mut sighash_cache = SighashCache::new(&tx);
+    let prevouts = vec![TxOut {
+        value: Amount::from_sat(utxo_amount_sats),
+        script_pubkey: bitcoin::Address::p2tr(&secp, xonly, None, BtcNetwork::Testnet).script_pubkey(),
+    }];
+
+    let sighash = sighash_cache.taproot_key_spend_signature_hash(
+        0,
+        &bitcoin::sighash::Prevouts::All(&prevouts),
+        TapSighashType::Default,
+    ).ok()?;
+
+  use bitcoin_hashes::Hash; let msg = bitcoin::secp256k1::Message::from_digest(*sighash.as_byte_array());
+    let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret_key);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    let mut witness = bitcoin::Witness::new();
+    witness.push(sig.as_ref());
+    tx.input[0].witness = witness;
+
+    // Serialize and broadcast
+    let tx_hex = bitcoin::consensus::encode::serialize_hex(&tx);
+    let result = crate::rpc_call("sendrawtransaction", serde_json::json!([tx_hex])).await;
+
+    match result {
+        Ok(v) => v.as_str().map(|s| s.to_string()),
+        Err(e) => {
+            tracing::warn!("Raw transaction broadcast failed: {} — trying fallback", e);
+            None
+        }
+    }
 }
 
 async fn stablecoin_deposit(
