@@ -83,9 +83,9 @@ fn hash_recovery_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-#[derive(Deserialize)] struct CreateVaultRequest { user_pubkey: String, network: Option<String>, recovery_blocks: Option<i32>, account_type: Option<String> }
-#[derive(Serialize)] struct CreateVaultResponse { vault_id: String, deposit_address: String, mast_address: Option<String>, network: String, recovery_blocks: i32, account_type: String, protocol_second_key: String, qsk_public: String, qsk_private: String, sphincs_pk: String, sphincs_sk: String, kyber_pk: String, kyber_sk: String }
-#[derive(Serialize)] struct VaultStatus { vault_id: String, status: String, deposit_address: String, btc_amount_sats: i64, ubtc_minted: String, confirmations: i32, account_type: String, mast_address: Option<String>, network: String }
+#[derive(Deserialize)] struct CreateVaultRequest { user_pubkey: String, network: Option<String>, recovery_blocks: Option<i32>, account_type: Option<String>, username: Option<String>, wallet_name: Option<String> }
+#[derive(Serialize)] struct CreateVaultResponse { vault_id: String, deposit_address: String, mast_address: Option<String>, network: String, recovery_blocks: i32, account_type: String, protocol_second_key: String, qsk_public: String, qsk_private: String, sphincs_pk: String, sphincs_sk: String, kyber_pk: String, kyber_sk: String, wallet_address: String }
+#[derive(Serialize)] struct VaultStatus { vault_id: String, status: String, deposit_address: String, btc_amount_sats: i64, ubtc_minted: String, confirmations: i32, account_type: String, mast_address: Option<String>, network: String, linked_wallet: Option<String> }
 #[derive(Deserialize)] struct MintRequest { vault_id: String, ubtc_amount: String, wallet_address: Option<String> }
 #[derive(Serialize)] struct MintResponse { mint_id: String, vault_id: String, ubtc_minted: String, collateral_ratio: String, max_mintable: String, btc_price_usd: String }
 #[derive(Deserialize)] struct BurnRequest { vault_id: String, ubtc_to_burn: String }
@@ -482,15 +482,39 @@ async fn create_vault(
             Err(e) => tracing::warn!("Could not import MAST address: {}", e),
         }
     }
+  // Auto-create and link a wallet to this vault — one account = one key file
+    let wallet_address = format!("ubtc{}", &hex::encode(uuid::Uuid::new_v4().as_bytes())[..24]);
+    let user_id = format!("usr_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let wallet_name = req.username.clone().unwrap_or_else(|| format!("user_{}", &vault_id[6..14]));
+  // Create user record first (required by foreign key)
+    sqlx::query("INSERT INTO ubtc_users (id, username, email, wallet_address, created_at) VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT DO NOTHING")
+        .bind(&user_id)
+        .bind(&wallet_name)
+        .bind(format!("{}@ubtc.local", wallet_name))
+        .bind(&wallet_address)
+        .execute(&pool).await.ok();
+    match sqlx::query(
+        "INSERT INTO ubtc_wallets (id, user_id, wallet_name, wallet_address, public_key, balance, linked_vault_id, created_at) VALUES ($1, $2, $3, $4, $5, '0', $6, NOW())"
+    )
+        .bind(format!("wal_{}", &uuid::Uuid::new_v4().to_string()[..8]))
+        .bind(&user_id)
+        .bind(&wallet_name)
+        .bind(&wallet_address)
+        .bind(&qkp.public_key)
+        .bind(&vault_id)
+        .execute(&pool).await {
+            Ok(_) => tracing::info!("Created vault {} with auto-linked wallet {}", vault_id, wallet_address),
+            Err(e) => tracing::error!("Failed to create auto-wallet: {}", e),
+        }
     tracing::info!("Created vault {} type={} with quantum keypair", vault_id, account_type);
-Ok(Json(CreateVaultResponse { vault_id, deposit_address, mast_address, network, recovery_blocks, account_type, protocol_second_key, qsk_public: qkp.public_key, qsk_private: qkp.secret_key, sphincs_pk, sphincs_sk, kyber_pk, kyber_sk }))
+   Ok(Json(CreateVaultResponse { vault_id, deposit_address, mast_address, network, recovery_blocks, account_type, protocol_second_key, qsk_public: qkp.public_key, qsk_private: qkp.secret_key, sphincs_pk, sphincs_sk, kyber_pk, kyber_sk, wallet_address }))
 }
 
 async fn get_vault(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<VaultStatus>, StatusCode> {
-    let row = sqlx::query("SELECT id, status, deposit_address, btc_amount_sats, ubtc_minted, confirmations, account_type, mast_address, network FROM vaults WHERE id = $1")
+   let row = sqlx::query("SELECT v.id, v.status, v.deposit_address, v.btc_amount_sats, v.ubtc_minted, v.confirmations, v.account_type, v.mast_address, v.network, w.wallet_address as linked_wallet FROM vaults v LEFT JOIN ubtc_wallets w ON w.linked_vault_id = v.id WHERE v.id = $1")
         .bind(&id).fetch_one(&pool).await.map_err(|_| StatusCode::NOT_FOUND)?;
     use sqlx::Row;
     Ok(Json(VaultStatus {
@@ -500,11 +524,11 @@ async fn get_vault(
         ubtc_minted: row.get("ubtc_minted"),
         confirmations: row.get("confirmations"),
         account_type: row.get("account_type"),
-        mast_address: row.try_get("mast_address").unwrap_or(None),
+      mast_address: row.try_get("mast_address").unwrap_or(None),
         network: row.try_get("network").unwrap_or_else(|_| "testnet4".to_string()),
+        linked_wallet: row.try_get("linked_wallet").unwrap_or(None),
     }))
 }
-
 async fn get_transactions(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1090,7 +1114,7 @@ async fn dashboard(
 ) -> Result<Json<DashboardResponse>, StatusCode> {
     use sqlx::Row;
     let rows = sqlx::query("SELECT id, status, deposit_address, btc_amount_sats, ubtc_minted, confirmations, account_type FROM vaults ORDER BY created_at DESC").fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-  let vaults: Vec<VaultStatus> = rows.iter().map(|row| VaultStatus { vault_id: row.get("id"), status: row.get("status"), deposit_address: row.get("deposit_address"), btc_amount_sats: row.get("btc_amount_sats"), ubtc_minted: row.get("ubtc_minted"), confirmations: row.get("confirmations"), account_type: row.get("account_type"), mast_address: row.try_get("mast_address").unwrap_or(None), network: row.try_get("network").unwrap_or_else(|_| "testnet4".to_string()) }).collect();
+ let vaults: Vec<VaultStatus> = rows.iter().map(|row| VaultStatus { vault_id: row.get("id"), status: row.get("status"), deposit_address: row.get("deposit_address"), btc_amount_sats: row.get("btc_amount_sats"), ubtc_minted: row.get("ubtc_minted"), confirmations: row.get("confirmations"), account_type: row.get("account_type"), mast_address: row.try_get("mast_address").unwrap_or(None), network: row.try_get("network").unwrap_or_else(|_| "testnet4".to_string()), linked_wallet: None }).collect();
     let active_vaults = vaults.iter().filter(|v| v.status == "active").count() as i64;
     let total_btc_sats: i64 = vaults.iter().map(|v| v.btc_amount_sats).sum();
     let total_ubtc: Decimal = vaults.iter().map(|v| Decimal::from_str(&v.ubtc_minted).unwrap_or(dec!(0))).sum();
@@ -1378,11 +1402,18 @@ async fn wallet_otp_verify(
         .bind(&vault_id).fetch_optional(&pool).await.ok().flatten();
     let stored_hash = vault_key_row.and_then(|r| r.try_get::<String, _>("protocol_key_hash").ok()).unwrap_or_default();
     let env_key = std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default();
-   let key_valid = if !stored_hash.is_empty() {
+  let key_valid = if !stored_hash.is_empty() {
         use sha2::{Sha256, Digest};
-        let combined = format!("{}{}", req.second_key, "ubtc-psk-salt-2026");
-        let submitted_hash = hex::encode(Sha256::digest(combined.as_bytes()));
-        submitted_hash == stored_hash
+        // Decode hex PSK to raw bytes — must match vault creation hashing
+        if let Ok(psk_bytes) = hex::decode(&req.second_key) {
+            let mut hasher = Sha256::new();
+            hasher.update(&psk_bytes);
+            hasher.update(b"ubtc-psk-salt-2026");
+            let submitted_hash = hex::encode(hasher.finalize());
+            submitted_hash == stored_hash
+        } else {
+            false
+        }
     } else {
         req.second_key == env_key && !env_key.is_empty()
     };
