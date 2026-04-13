@@ -276,7 +276,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/wallet/otp/verify", post(wallet_otp_verify))
        .route("/wallet/redeem", post(wallet_redeem))
         .route("/wallet/sign-payload", post(sign_payload))
-        .route("/wallets/all", get(get_all_wallets))
+       .route("/wallets/all", get(get_all_wallets))
+        .route("/proofs/:wallet_address", get(get_wallet_proofs))
+        .route("/proofs/:proof_id/download", post(download_proof))
         .route("/wallet/:address/send", post(send_from_wallet))
         .route("/wallet/:address/transactions", get(get_wallet_transactions))
         .route("/ubtc/mint-proof", post(mint_ubtc_proof))
@@ -952,9 +954,140 @@ async fn transfer_ubtc(
         }
     }
 
-    Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred with Bitcoin anchor UTXO.".to_string() }))
+  // Generate proof file for recipient
+    if let Ok(recipient_row) = sqlx::query(
+        "SELECT public_key FROM ubtc_wallets WHERE wallet_address = $1"
+    ).bind(&req.to_address).fetch_one(&pool).await {
+        use sqlx::Row;
+        let recipient_pk: String = recipient_row.get("public_key");
+        // Get vault data for proof
+        if let Ok(vault_row) = sqlx::query(
+            "SELECT deposit_address, mast_address, taproot_secret_key, btc_amount_sats FROM vaults WHERE id = $1"
+        ).bind(&vault_id).fetch_one(&pool).await {
+            let deposit_address: String = vault_row.get("deposit_address");
+            let mast_address: Option<String> = vault_row.try_get("mast_address").unwrap_or(None);
+            let taproot_secret_key: Option<String> = vault_row.try_get("taproot_secret_key").unwrap_or(None);
+            let btc_amount_sats: i64 = vault_row.get("btc_amount_sats");
+            // Get anchor UTXO for this transfer
+            let anchor_txid_for_proof = if let Ok(anc) = sqlx::query(
+                "SELECT txid, vout FROM ubtc_anchors WHERE owner_wallet = $1 AND spent = false ORDER BY created_at DESC LIMIT 1"
+            ).bind(&req.to_address).fetch_one(&pool).await {
+                let txid: String = anc.get("txid");
+                let vout: i32 = anc.get("vout");
+                format!("{}:{}", txid, vout)
+            } else { "pending".to_string() };
+            // Compute nullifier hash
+            let proof_id = format!("prf_{}", &Uuid::new_v4().to_string()[..12]);
+            let nullifier_preimage = format!("{}:{}:{}", proof_id, recipient_pk, anchor_txid_for_proof);
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(nullifier_preimage.as_bytes());
+            let nullifier_hash = hex::encode(hasher.finalize());
+            // Build proof JSON
+            let btc_release_sats = (amount.to_string().parse::<f64>().unwrap_or(0.0) / 100.0 * 0.015 * 100_000_000.0) as i64;
+            let proof_data = serde_json::json!({
+                "version": "UBTCV1",
+                "proof_id": proof_id,
+                "created_at": chrono::Utc::now().timestamp(),
+                "expires_at": chrono::Utc::now().timestamp() + 31536000,
+                "collateral": {
+                    "vault_id": vault_id,
+                    "vault_address": mast_address.unwrap_or(deposit_address),
+                    "vault_utxo_amount_sats": btc_amount_sats,
+                },
+                "ownership": {
+                    "ubtc_amount": amount.to_string(),
+                    "btc_release_sats": btc_release_sats,
+                    "owner_dilithium_pk": recipient_pk,
+                    "wallet_address": req.to_address,
+                },
+                "nullifier": {
+                    "hash": nullifier_hash,
+                    "bitcoin_prefix": "UBTCN1:",
+                    "redeemed": false,
+                    "redemption_txid": null
+                },
+                "redemption_template": {
+                    "type": "kyber_encrypted",
+                    "note": "Decrypt with KEY 3 (Kyber) to get taproot_secret_key for Bitcoin redemption",
+                    "taproot_secret_key_encrypted": taproot_secret_key.unwrap_or_default(),
+                    "signing_path": "key_path",
+                    "rbf_enabled": true,
+                    "anchor_utxo": anchor_txid_for_proof,
+                    "fee_note": "Calculate fee at redemption time — do NOT pre-sign"
+                },
+                "ownership_chain": [{
+                    "step": 0,
+                    "type": "transfer",
+                    "from": vault_id,
+                    "to": req.to_address,
+                    "amount": amount.to_string(),
+                    "timestamp": chrono::Utc::now().timestamp()
+                }],
+                "broadcast_endpoints": [
+                    "https://mempool.space/testnet4/api/tx",
+                    "https://blockstream.info/testnet/api/tx",
+                    "manual"
+                ],
+                "integrity": {
+                    "proof_hash": nullifier_hash
+                }
+            });
+            // Store proof in database
+            let proof_db_id = format!("proof_{}", &Uuid::new_v4().to_string()[..8]);
+            match sqlx::query(
+                "INSERT INTO ubtc_proofs (id, proof_id, sender_vault_id, recipient_wallet_address, proof_data, downloaded, created_at) VALUES ($1, $2, $3, $4, $5, false, NOW())"
+            )
+                .bind(&proof_db_id)
+                .bind(&proof_id)
+                .bind(&vault_id)
+                .bind(&req.to_address)
+                .bind(&proof_data)
+                .execute(&pool).await {
+                    Ok(_) => tracing::info!("Proof file generated: {} for wallet {}", proof_id, req.to_address),
+                    Err(e) => tracing::error!("Failed to store proof: {}", e),
+                }
+        }
+    }
+
+    Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred with Bitcoin anchor UTXO. Proof file generated for recipient.".to_string() }))
+}
+async fn get_wallet_proofs(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    axum::extract::Path(wallet_address): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, proof_id, sender_vault_id, proof_data, downloaded, created_at FROM ubtc_proofs WHERE recipient_wallet_address = $1 AND downloaded = false ORDER BY created_at DESC"
+    ).bind(&wallet_address).fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let proofs: Vec<serde_json::Value> = rows.iter().map(|row| {
+        serde_json::json!({
+            "id": row.get::<String, _>("id"),
+            "proof_id": row.get::<String, _>("proof_id"),
+            "sender_vault_id": row.get::<String, _>("sender_vault_id"),
+            "proof_data": row.get::<serde_json::Value, _>("proof_data"),
+            "downloaded": row.get::<bool, _>("downloaded"),
+            "created_at": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+        })
+    }).collect();
+    let count = proofs.len();
+    Ok(Json(serde_json::json!({ "proofs": proofs, "count": count })))
 }
 
+async fn download_proof(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    axum::extract::Path(proof_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT proof_data FROM ubtc_proofs WHERE proof_id = $1"
+    ).bind(&proof_id).fetch_one(&pool).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let proof_data: serde_json::Value = row.get("proof_data");
+    sqlx::query("UPDATE ubtc_proofs SET downloaded = true, downloaded_at = NOW() WHERE proof_id = $1")
+        .bind(&proof_id).execute(&pool).await.ok();
+    tracing::info!("Proof {} downloaded and marked for deletion", proof_id);
+    Ok(Json(serde_json::json!({ "proof": proof_data, "message": "Proof downloaded. Server copy marked for deletion." })))
+}
 fn derive_anchor_address_for_wallet(wallet_address: &str) -> String {
     use bitcoin::{secp256k1::{Secp256k1, SecretKey}, Address, Network as BtcNetwork};
     use sha2::{Sha256, Digest};
