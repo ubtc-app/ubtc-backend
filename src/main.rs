@@ -86,7 +86,7 @@ fn hash_recovery_key(key: &str) -> String {
 #[derive(Deserialize)] struct CreateVaultRequest { user_pubkey: String, network: Option<String>, recovery_blocks: Option<i32>, account_type: Option<String> }
 #[derive(Serialize)] struct CreateVaultResponse { vault_id: String, deposit_address: String, mast_address: Option<String>, network: String, recovery_blocks: i32, account_type: String, protocol_second_key: String, qsk_public: String, qsk_private: String, sphincs_pk: String, sphincs_sk: String, kyber_pk: String, kyber_sk: String }
 #[derive(Serialize)] struct VaultStatus { vault_id: String, status: String, deposit_address: String, btc_amount_sats: i64, ubtc_minted: String, confirmations: i32, account_type: String, mast_address: Option<String>, network: String }
-#[derive(Deserialize)] struct MintRequest { vault_id: String, ubtc_amount: String }
+#[derive(Deserialize)] struct MintRequest { vault_id: String, ubtc_amount: String, wallet_address: Option<String> }
 #[derive(Serialize)] struct MintResponse { mint_id: String, vault_id: String, ubtc_minted: String, collateral_ratio: String, max_mintable: String, btc_price_usd: String }
 #[derive(Deserialize)] struct BurnRequest { vault_id: String, ubtc_to_burn: String }
 #[derive(Serialize)] struct BurnResponse { burn_id: String, vault_id: String, ubtc_burned: String, new_outstanding: String, vault_status: String }
@@ -740,7 +740,73 @@ async fn mint_ubtc(
     sqlx::query("INSERT INTO mints (id, vault_id, ubtc_amount, btc_price_usd, collateral_ratio, status, created_at) VALUES ($1, $2, $3, $4, $5, 'active', NOW())").bind(&mint_id).bind(&vault_id).bind(requested.to_string()).bind(btc_price.to_string()).bind(collateral_ratio.to_string()).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("db error: {}", e)}))))?;
     sqlx::query("UPDATE vaults SET ubtc_minted = $1 WHERE id = $2").bind(total_after.to_string()).bind(&vault_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("db error: {}", e)}))))?;
     tracing::info!("Minted {} UBTC from vault {}", requested, vault_id);
+  // Create 1-sat UTXO anchor on Bitcoin for this UBTC mint
+    let owner = req.wallet_address.as_deref().unwrap_or(&vault_id);
+    create_ubtc_anchor(&pool, &vault_id, requested.to_string().as_str(), owner).await;
+    tracing::info!("Minted {} UBTC from vault {}", requested, vault_id);
     Ok(Json(MintResponse { mint_id, vault_id, ubtc_minted: total_after.to_string(), collateral_ratio: collateral_ratio.to_string(), max_mintable: max_mintable.to_string(), btc_price_usd: btc_price.to_string() }))
+}
+
+async fn create_ubtc_anchor(pool: &sqlx::PgPool, vault_id: &str, ubtc_amount: &str, owner_wallet: &str) -> Option<String> {
+    use bitcoin::{
+        secp256k1::{Secp256k1, SecretKey},
+        Address, Network as BtcNetwork,
+    };
+    use sha2::{Sha256, Digest};
+
+    let secp = Secp256k1::new();
+
+    // Derive a unique anchor key from vault_id + owner_wallet + ubtc_amount
+    let mut hasher = Sha256::new();
+    hasher.update(vault_id.as_bytes());
+    hasher.update(owner_wallet.as_bytes());
+    hasher.update(ubtc_amount.as_bytes());
+    hasher.update(b"ubtc-anchor-v1");
+    let key_bytes = hasher.finalize();
+
+    let secret_key = SecretKey::from_slice(&key_bytes).ok()?;
+    let pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+    let (xonly, _) = pubkey.x_only_public_key();
+
+    // Generate Taproot anchor address
+    let anchor_address = Address::p2tr(&secp, xonly, None, BtcNetwork::Testnet);
+    let anchor_addr_str = anchor_address.to_string();
+
+    tracing::info!("Creating 1-sat anchor at Taproot address: {}", anchor_addr_str);
+
+  // Send 546 sats (dust limit) to anchor address via Bitcoin Core
+    // Conceptually this is the "1-sat bearer instrument" for UBTC ownership
+    let result = rpc_call("sendtoaddress", serde_json::json!([
+        anchor_addr_str,
+        0.00000546  // 546 sats — dust limit minimum for P2TR
+    ])).await;
+match result {
+        Ok(v) => {
+            let txid = v.as_str().unwrap_or("").to_string();
+            tracing::info!("1-sat anchor created — txid: {}", txid);
+            // Store anchor in database
+            let anchor_id = format!("anc_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            match sqlx::query(
+                "INSERT INTO ubtc_anchors (id, vault_id, owner_wallet, txid, vout, amount_sats, ubtc_amount, anchor_address, spent, created_at) VALUES ($1, $2, $3, $4, 0, 546, $5, $6, false, NOW())"
+            )
+                .bind(&anchor_id)
+                .bind(vault_id)
+                .bind(owner_wallet)
+                .bind(&txid)
+              .bind(ubtc_amount.parse::<f64>().unwrap_or(0.0))
+                .bind(&anchor_address.to_string())
+                .execute(pool).await {
+                    Ok(_) => tracing::info!("Anchor {} saved to DB", anchor_id),
+                    Err(e) => tracing::error!("Failed to save anchor to DB: {}", e),
+                }
+            Some(txid)
+        }
+        Err(e) => {
+            tracing::warn!("Could not create 1-sat anchor: {}", e);
+            None
+        }
+    }
+
 }
 
 async fn burn_ubtc(
