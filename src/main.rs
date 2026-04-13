@@ -277,8 +277,9 @@ async fn main() -> anyhow::Result<()> {
        .route("/wallet/redeem", post(wallet_redeem))
         .route("/wallet/sign-payload", post(sign_payload))
        .route("/wallets/all", get(get_all_wallets))
-        .route("/proofs/:wallet_address", get(get_wallet_proofs))
+      .route("/proofs/:wallet_address", get(get_wallet_proofs))
         .route("/proofs/:proof_id/download", post(download_proof))
+        .route("/proofs/redeem", post(redeem_proof))
         .route("/wallet/:address/send", post(send_from_wallet))
         .route("/wallet/:address/transactions", get(get_wallet_transactions))
         .route("/ubtc/mint-proof", post(mint_ubtc_proof))
@@ -1052,6 +1053,141 @@ async fn transfer_ubtc(
 
     Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred with Bitcoin anchor UTXO. Proof file generated for recipient.".to_string() }))
 }
+async fn redeem_proof(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row;
+    let proof_id = req["proof_id"].as_str().unwrap_or("");
+    let vault_id = req["vault_id"].as_str().unwrap_or("");
+    let destination = req["destination_address"].as_str().unwrap_or("");
+    let ubtc_amount = req["ubtc_amount"].as_str().unwrap_or("0");
+    let fee_rate = req["fee_rate"].as_i64().unwrap_or(2);
+
+    if proof_id.is_empty() || vault_id.is_empty() || destination.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "proof_id, vault_id and destination_address required"}))));
+    }
+
+    // Get vault taproot secret key for signing
+    let vault_row = sqlx::query(
+        "SELECT taproot_secret_key, btc_amount_sats, deposit_address FROM vaults WHERE id = $1"
+    ).bind(vault_id).fetch_one(&pool).await
+        .map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "vault not found"}))))?;
+
+    let taproot_secret_key: Option<String> = vault_row.try_get("taproot_secret_key").unwrap_or(None);
+    let btc_amount_sats: i64 = vault_row.get("btc_amount_sats");
+
+    let tsk = taproot_secret_key.ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "vault has no taproot key — cannot redeem"}))))?;
+
+    // Calculate amount to release (proportional to ubtc burned)
+    let ubtc_f = ubtc_amount.parse::<f64>().unwrap_or(0.0);
+    let fee_sats = fee_rate * 200;
+    let release_sats = (ubtc_f / 100.0 * btc_amount_sats as f64) as i64 - fee_sats;
+
+    if release_sats < 546 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("release amount {} sats is below dust limit after fees", release_sats)}))));
+    }
+
+ // Build and broadcast redemption transaction using existing taproot spend logic
+    let txid = {
+       use bitcoin::{secp256k1::{Secp256k1, SecretKey}, Network as BtcNetwork};
+        use bitcoin::{Transaction, TxIn, TxOut, OutPoint, Txid as BtcTxid, ScriptBuf, Witness, Sequence, absolute::LockTime};
+        use bitcoin::address::Address as BtcAddress;
+        use bitcoin_hashes::Hash;
+        use std::str::FromStr;
+        // Get the vault UTXO to spend
+        let utxo_row = sqlx::query(
+            "SELECT txid, vout, amount_sats FROM vault_utxos WHERE vault_id = $1 AND spent = false ORDER BY created_at DESC LIMIT 1"
+        ).bind(vault_id).fetch_optional(&pool).await.unwrap_or(None);
+
+        if let Some(utxo) = utxo_row {
+            let utxo_txid: String = utxo.get("txid");
+            let utxo_vout: i32 = utxo.get("vout");
+            let utxo_amount: i64 = utxo.get("amount_sats");
+            let key_bytes = hex::decode(&tsk).unwrap_or_default();
+            let secp = Secp256k1::new();
+            if let Ok(sk) = SecretKey::from_slice(&key_bytes) {
+                let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &sk);
+                let (xonly_pk, _) = keypair.x_only_public_key();
+                let dest_addr = BtcAddress::from_str(destination)
+                    .ok().and_then(|a| a.require_network(BtcNetwork::Testnet).ok());
+                if let Some(addr) = dest_addr {
+                    let mut tx = Transaction {
+                        version: bitcoin::transaction::Version::TWO,
+                        lock_time: LockTime::ZERO,
+                        input: vec![TxIn {
+                            previous_output: OutPoint {
+                               txid: BtcTxid::from_str(&utxo_txid).unwrap_or_else(|_| BtcTxid::from_raw_hash(bitcoin_hashes::sha256d::Hash::all_zeros())),
+                                vout: utxo_vout as u32,
+                            },
+                            script_sig: ScriptBuf::new(),
+                            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                            witness: Witness::new(),
+                        }],
+                        output: vec![TxOut {
+                            value: bitcoin::Amount::from_sat(release_sats as u64),
+                            script_pubkey: addr.script_pubkey(),
+                        }],
+                    };
+                    // Sign with Schnorr (taproot key path)
+                    let sighash_type = bitcoin::sighash::TapSighashType::Default;
+                    let prevouts = vec![TxOut {
+                        value: bitcoin::Amount::from_sat(utxo_amount as u64),
+                        script_pubkey: BtcAddress::p2tr(&secp, xonly_pk, None, BtcNetwork::Testnet).script_pubkey(),
+                    }];
+                    let mut sighasher = bitcoin::sighash::SighashCache::new(&mut tx);
+                    let sighash = sighasher.taproot_key_spend_signature_hash(
+                        0, &bitcoin::sighash::Prevouts::All(&prevouts), sighash_type
+                  ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("sighash error: {}", e)}))))?;
+                    let msg = bitcoin::secp256k1::Message::from_digest(*sighash.as_byte_array());
+                    let sig = secp.sign_schnorr(&msg, &keypair);
+                 let final_sig = bitcoin::taproot::Signature { sig, hash_ty: bitcoin::sighash::TapSighashType::Default };
+                    *sighasher.witness_mut(0).unwrap() = Witness::from_slice(&[final_sig.to_vec()]);
+                    let raw_tx = bitcoin::consensus::encode::serialize(&tx);
+                    let raw_hex = hex::encode(&raw_tx);
+                    // Broadcast via Bitcoin Core RPC
+                    match rpc_call("sendrawtransaction", serde_json::json!([raw_hex])).await {
+                        Ok(v) => {
+                            let txid_str = v.as_str().unwrap_or("").to_string();
+                            // Mark UTXO as spent
+                            sqlx::query("UPDATE vault_utxos SET spent = true WHERE vault_id = $1 AND txid = $2")
+                                .bind(vault_id).bind(&utxo_txid).execute(&pool).await.ok();
+                            txid_str
+                        },
+                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("broadcast failed: {}", e)}))))
+                    }
+                } else {
+                    return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid destination address for testnet4"}))))
+                }
+            } else {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "invalid taproot secret key"}))))
+            }
+        } else {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "no unspent vault UTXO found — vault may already be redeemed"}))))
+        }
+    };
+
+    // Mark proof as redeemed
+    sqlx::query("UPDATE ubtc_proofs SET downloaded = true, downloaded_at = NOW() WHERE proof_id = $1")
+        .bind(proof_id).execute(&pool).await.ok();
+
+    // Update vault balance
+    let new_sats = (btc_amount_sats - release_sats - fee_sats).max(0);
+    sqlx::query("UPDATE vaults SET btc_amount_sats = $1 WHERE id = $2")
+        .bind(new_sats).bind(vault_id).execute(&pool).await.ok();
+
+    tracing::info!("Proof redemption broadcast: txid {} for proof {}", txid, proof_id);
+
+    Ok(Json(serde_json::json!({
+        "txid": txid,
+        "amount_sats": release_sats,
+        "fee_sats": fee_sats,
+        "destination": destination,
+        "proof_id": proof_id,
+        "message": "Redemption broadcast to Bitcoin network"
+    })))
+}
+
 async fn get_wallet_proofs(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     axum::extract::Path(wallet_address): axum::extract::Path<String>,
@@ -1758,17 +1894,7 @@ async fn check_nullifier(
     Ok(Json(serde_json::json!({"nullifier": hex, "spent": row.is_some()})))
 }
 
-async fn redeem_proof(
-    Json(req): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let _proof = req["proof"].as_object().ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"proof required"}))))?;
-    let destination = req["destination_address"].as_str().ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"destination_address required"}))))?;
-    Ok(Json(serde_json::json!({
-        "status": "verified",
-        "destination": destination,
-        "message": "Proof verified. Use your Kyber key to decrypt the embedded redemption transaction and broadcast to Bitcoin."
-    })))
-}
+
 
 async fn redeem_ubtc(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
