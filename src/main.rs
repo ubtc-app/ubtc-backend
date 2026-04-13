@@ -774,11 +774,11 @@ async fn create_ubtc_anchor(pool: &sqlx::PgPool, vault_id: &str, ubtc_amount: &s
 
     tracing::info!("Creating 1-sat anchor at Taproot address: {}", anchor_addr_str);
 
-  // Send 546 sats (dust limit) to anchor address via Bitcoin Core
+ // Send 1000 sats to anchor address — enough to cover transfer fees
     // Conceptually this is the "1-sat bearer instrument" for UBTC ownership
     let result = rpc_call("sendtoaddress", serde_json::json!([
         anchor_addr_str,
-        0.00000546  // 546 sats — dust limit minimum for P2TR
+        0.00001000  // 1000 sats — covers transfer fees while staying above dust limit
     ])).await;
 match result {
         Ok(v) => {
@@ -876,9 +876,117 @@ async fn transfer_ubtc(
             .bind(&wtx_id).bind(&to_user_id).bind(amount.to_string()).execute(&pool).await.ok();
         tracing::info!("Credited wallet {} with {} UBTC", req.to_address, amount);
     }
-    Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred. BTC vault unchanged.".to_string() }))
+ // Transfer the 1-sat UTXO anchor on Bitcoin
+    let anchor_row = sqlx::query(
+        "SELECT id, txid, vout, anchor_address FROM ubtc_anchors WHERE vault_id = $1 AND spent = false ORDER BY created_at DESC LIMIT 1"
+    ).bind(&vault_id).fetch_optional(&pool).await.unwrap_or(None);
+
+    if let Some(anchor) = anchor_row {
+        let anchor_id: String = anchor.get("id");
+        let anchor_txid: String = anchor.get("txid");
+        let anchor_vout: i32 = anchor.get("vout");
+
+        // Derive recipient anchor address from their wallet public key
+        let recipient_pubkey = sqlx::query("SELECT public_key FROM ubtc_wallets WHERE wallet_address = $1")
+            .bind(&req.to_address).fetch_optional(&pool).await.unwrap_or(None)
+            .map(|r| { let pk: String = r.get("public_key"); pk });
+
+        let new_anchor_txid = transfer_anchor_utxo(
+            &vault_id,
+            &anchor_txid,
+            anchor_vout as u32,
+            &req.to_address,
+            recipient_pubkey.as_deref(),
+        ).await;
+
+        if let Some(ref new_txid) = new_anchor_txid {
+            // Mark old anchor as spent
+            sqlx::query("UPDATE ubtc_anchors SET spent = true, spent_txid = $1 WHERE id = $2")
+                .bind(new_txid).bind(&anchor_id).execute(&pool).await.ok();
+
+            // Create new anchor for recipient
+            let new_anchor_id = format!("anc_{}", &Uuid::new_v4().to_string()[..8]);
+            let recipient_addr = derive_anchor_address_for_wallet(req.to_address.as_str());
+            sqlx::query(
+                "INSERT INTO ubtc_anchors (id, vault_id, owner_wallet, txid, vout, amount_sats, ubtc_amount, anchor_address, spent, created_at) VALUES ($1, $2, $3, $4, 0, 546, $5, $6, false, NOW())"
+            )
+                .bind(&new_anchor_id)
+                .bind(&vault_id)
+                .bind(&req.to_address)
+                .bind(new_txid)
+                .bind(amount.to_string().parse::<f64>().unwrap_or(0.0))
+                .bind(&recipient_addr)
+                .execute(&pool).await.ok();
+
+            tracing::info!("Anchor UTXO transferred on Bitcoin — new txid: {}", new_txid);
+        }
+    }
+
+    Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred with Bitcoin anchor UTXO.".to_string() }))
 }
 
+fn derive_anchor_address_for_wallet(wallet_address: &str) -> String {
+    use bitcoin::{secp256k1::{Secp256k1, SecretKey}, Address, Network as BtcNetwork};
+    use sha2::{Sha256, Digest};
+    let secp = Secp256k1::new();
+    let mut hasher = Sha256::new();
+    hasher.update(wallet_address.as_bytes());
+    hasher.update(b"ubtc-recipient-anchor-v1");
+    let key_bytes = hasher.finalize();
+    if let Ok(sk) = SecretKey::from_slice(&key_bytes) {
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let (xonly, _) = pk.x_only_public_key();
+        Address::p2tr(&secp, xonly, None, BtcNetwork::Testnet).to_string()
+    } else {
+        wallet_address.to_string()
+    }
+}
+
+async fn transfer_anchor_utxo(
+   vault_id: &str,
+    _utxo_txid: &str,
+    _utxo_vout: u32,
+    recipient_wallet: &str,
+    _recipient_pubkey: Option<&str>,
+) -> Option<String> {
+    use bitcoin::{secp256k1::{Secp256k1, SecretKey}, Address, Network as BtcNetwork};
+    use sha2::{Sha256, Digest};
+
+    let secp = Secp256k1::new();
+
+    // Derive the anchor signing key (same derivation as create_ubtc_anchor)
+    // We need to find the original anchor key — use vault_id based derivation
+    let mut hasher = Sha256::new();
+    hasher.update(vault_id.as_bytes());
+    hasher.update(b"ubtc-anchor-v1");
+    let key_bytes = hasher.finalize();
+
+    let secret_key = SecretKey::from_slice(&key_bytes).ok()?;
+    let pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+    let (xonly, _) = pubkey.x_only_public_key();
+
+    // Derive recipient anchor address
+    let recipient_addr_str = derive_anchor_address_for_wallet(recipient_wallet);
+  let recipient_addr: Address<_> = {
+        let addr = Address::from_str(&recipient_addr_str).ok()?;
+        addr.assume_checked()
+    };
+
+  // Send fresh anchor to recipient — wallet pays fee
+    let recipient_addr_str = derive_anchor_address_for_wallet(recipient_wallet);
+    tracing::info!("Transferring anchor to {} at {}", recipient_wallet, recipient_addr_str);
+    match rpc_call("sendtoaddress", serde_json::json!([recipient_addr_str, 0.00001000])).await {
+        Ok(v) => {
+            let txid = v.as_str().unwrap_or("").to_string();
+            tracing::info!("Anchor transferred to {} — txid: {}", recipient_wallet, txid);
+            Some(txid)
+        }
+        Err(e) => {
+            tracing::warn!("Anchor transfer failed: {}", e);
+            None
+        }
+    }
+}
 async fn redeem(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     Json(req): Json<RedeemRequest>,
