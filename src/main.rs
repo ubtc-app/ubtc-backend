@@ -487,12 +487,18 @@ async fn create_vault(
     let user_id = format!("usr_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let wallet_name = req.username.clone().unwrap_or_else(|| format!("user_{}", &vault_id[6..14]));
   // Create user record first (required by foreign key)
-    sqlx::query("INSERT INTO ubtc_users (id, username, email, wallet_address, created_at) VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT DO NOTHING")
+    // Use completely unique email/username with user_id suffix to avoid conflicts
+    let unique_username = format!("{}_{}", wallet_name, &user_id[4..]);
+    let unique_email = format!("{}@ubtc.local", &user_id);
+    match sqlx::query("INSERT INTO ubtc_users (id, username, email, wallet_address, created_at) VALUES ($1, $2, $3, $4, NOW())")
         .bind(&user_id)
-        .bind(&wallet_name)
-        .bind(format!("{}@ubtc.local", wallet_name))
+        .bind(&unique_username)
+        .bind(&unique_email)
         .bind(&wallet_address)
-        .execute(&pool).await.ok();
+        .execute(&pool).await {
+            Ok(_) => tracing::info!("Created user record {}", user_id),
+            Err(e) => tracing::error!("Failed to create user record: {}", e),
+        }
     match sqlx::query(
         "INSERT INTO ubtc_wallets (id, user_id, wallet_name, wallet_address, public_key, balance, linked_vault_id, created_at) VALUES ($1, $2, $3, $4, $5, '0', $6, NOW())"
     )
