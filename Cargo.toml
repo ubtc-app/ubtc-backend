@@ -28,3 +28,5 @@ base64 = "0.21"
 hex = "0.4"
 sha2 = "0.10"
 ubtc-protocol = { path = "../../ubtc-protocol" }
+bitcoin = { version = "0.31", features = ["rand-std"] }
+secp256k1 = { version = "0.28", features = ["rand-std", "global-context"] }

@@ -152,6 +152,71 @@ fn get_network() -> Network {
     }
 }
 
+fn build_vault_mast(user_pubkey_hex: &str, wlb_pubkey_hex: &str) -> Option<String> {
+    use bitcoin::secp256k1::{Secp256k1, PublicKey};
+    use bitcoin::taproot::{TaprootBuilder, LeafVersion};
+    use bitcoin::script::Builder;
+    use bitcoin::opcodes::all::*;
+    use bitcoin::{XOnlyPublicKey, Network as BtcNetwork};
+    use bitcoin::Address;
+
+    let secp = Secp256k1::new();
+
+    // Parse user public key
+    let user_pk_bytes = hex::decode(user_pubkey_hex).ok()?;
+    let user_pk = PublicKey::from_slice(&user_pk_bytes).ok()?;
+    let (user_xonly, _) = user_pk.x_only_public_key();
+
+    // Use WLB key or generate a deterministic one
+    let wlb_pk_bytes = hex::decode(wlb_pubkey_hex).ok()
+        .and_then(|b| PublicKey::from_slice(&b).ok());
+
+    // PATH 1 — User withdrawal (key path — most efficient)
+    // Just user signature — this is the taproot key path spend
+    // No script needed for key path
+
+    // PATH 2 — Liquidation script (script path leaf 1)
+    // Requires: WLB oracle signature
+    let liquidation_script = if let Some(wlb_pk) = &wlb_pk_bytes {
+        let (wlb_xonly, _) = wlb_pk.x_only_public_key();
+        Builder::new()
+            .push_x_only_key(&wlb_xonly)
+            .push_opcode(OP_CHECKSIG)
+            .into_script()
+    } else {
+        Builder::new()
+            .push_x_only_key(&user_xonly)
+            .push_opcode(OP_CHECKSIG)
+            .into_script()
+    };
+
+    // PATH 3 — Recovery script (script path leaf 2)
+    // Requires: user signature + 144 block timelock (~24 hours)
+    let recovery_script = Builder::new()
+        .push_int(144)
+        .push_opcode(OP_CSV)
+        .push_opcode(OP_DROP)
+        .push_x_only_key(&user_xonly)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
+
+    // Build MAST tree
+    let builder = TaprootBuilder::new()
+        .add_leaf(1, liquidation_script).ok()?
+        .add_leaf(1, recovery_script).ok()?;
+
+    let spend_info = builder.finalize(&secp, user_xonly).ok()?;
+
+    // Generate the Taproot address
+    let network = match get_network() {
+        Network::Testnet4 | Network::Regtest => BtcNetwork::Testnet,
+        Network::Mainnet => BtcNetwork::Bitcoin,
+    };
+
+    let address = Address::p2tr_tweaked(spend_info.output_key(), network);
+    Some(address.to_string())
+}
+
 fn get_rpc() -> (String, String, String) {
     let default_url = match get_network() {
         Network::Testnet4 => "http://127.0.0.1:48332",
@@ -366,6 +431,36 @@ async fn create_vault(
     // Store public key in vault for transfer verification
     sqlx::query("UPDATE vaults SET user_pubkey = $1 WHERE id = $2")
         .bind(&qkp.public_key).bind(&vault_id).execute(&pool).await.ok();
+    // Build Taproot MAST vault address with spending paths
+    // Generate a secp256k1 keypair for the Taproot internal key
+    let mast_address = {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use sha2::{Sha256, Digest};
+        // Derive secp256k1 key from vault_id + quantum key hash
+        let mut hasher = Sha256::new();
+        hasher.update(vault_id.as_bytes());
+        hasher.update(qkp.secret_key.as_bytes());
+        hasher.update(b"ubtc-taproot-key-v1");
+        let key_bytes = hasher.finalize();
+        let secp = Secp256k1::new();
+        if let Ok(secret_key) = SecretKey::from_slice(&key_bytes) {
+            let user_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+            let user_pubkey_hex = hex::encode(user_pubkey.serialize());
+            let wlb_pubkey = std::env::var("WLB_TAPROOT_PUBKEY").unwrap_or_else(|_|
+                "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0".to_string()
+            );
+            // Store the taproot secret key for later spending
+            sqlx::query("UPDATE vaults SET taproot_secret_key = $1, taproot_pubkey = $2 WHERE id = $3")
+                .bind(hex::encode(key_bytes)).bind(&user_pubkey_hex).bind(&vault_id)
+                .execute(&pool).await.ok();
+            build_vault_mast(&user_pubkey_hex, &wlb_pubkey)
+        } else { None }
+    };
+    if let Some(ref mast_addr) = mast_address {
+        sqlx::query("UPDATE vaults SET mast_address = $1 WHERE id = $2")
+            .bind(mast_addr).bind(&vault_id).execute(&pool).await.ok();
+        tracing::info!("MAST vault address built: {}", mast_addr);
+    }
     tracing::info!("Created vault {} type={} with quantum keypair", vault_id, account_type);
   Ok(Json(CreateVaultResponse { vault_id, deposit_address, network, recovery_blocks, account_type, protocol_second_key, qsk_public: qkp.public_key, qsk_private: qkp.secret_key, sphincs_pk, sphincs_sk, kyber_pk, kyber_sk }))
 }
