@@ -307,8 +307,26 @@ async fn create_vault(
     let network = req.network.unwrap_or_else(|| "regtest".to_string());
     let recovery_blocks: i32 = req.recovery_blocks.unwrap_or(6);
     let account_type = req.account_type.unwrap_or_else(|| "current".to_string());
-    let deposit_address = rpc_call("getnewaddress", serde_json::json!([])).await
-        .map(|v| v.as_str().unwrap_or("").to_string()).unwrap_or_default();
+ // Generate Taproot (P2TR) deposit address — tb1p prefix
+    let deposit_address = rpc_call("getnewaddress", serde_json::json!(["ubtc-vault", "bech32m"])).await
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let deposit_address = if deposit_address.starts_with("tb1p") || deposit_address.starts_with("bc1p") {
+        deposit_address
+    } else {
+        // Force Taproot via deriveaddresses
+        let taproot_desc = "tr([26494c70/86h/1h/0h]tpubDDU9sgfZcUTYRhNGVBBfErZxFNqnL16gCdjc8xMTdddm1sXBtwnCZw77P5TJnXC2UQMen251tM42ADRGzuN3N1e93RQPWpBWZiHGCHmxbZv/0/*)#q2y8nk7h";
+        let next_index: u64 = rpc_call("listdescriptors", serde_json::json!([])).await
+            .ok()
+            .and_then(|v| v["descriptors"].as_array().and_then(|arr| arr.iter()
+                .find(|d| d["desc"].as_str().unwrap_or("").contains("86h/1h/0h") && d["internal"].as_bool().unwrap_or(true) == false)
+                .and_then(|d| d["next"].as_u64())))
+            .unwrap_or(0);
+        rpc_call("deriveaddresses", serde_json::json!([taproot_desc, [next_index, next_index]])).await
+            .ok()
+            .and_then(|v| v.as_array().and_then(|a| a.first().and_then(|x| x.as_str().map(|s| s.to_string()))))
+            .unwrap_or_else(|| deposit_address.clone())
+    };
     // Generate unique Protocol Second Key for this vault
     use rand::RngCore;
     use sha2::{Sha256, Digest};
@@ -701,8 +719,8 @@ async fn withdraw_verify(
     if status != "pending" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("withdraw is {}", status)})))); }
     if chrono::Utc::now() > expires_at { sqlx::query("UPDATE transfer_requests SET status = 'expired' WHERE id = $1").bind(&req.withdraw_id).execute(&pool).await.ok(); return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"OTP expired"})))); }
     if !verify_otp(&otp_secret, &req.otp_code, &otp_code) { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid OTP"})))); }
-    use sha2::{Sha256, Digest};
-   let protocol_key = std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default();
+  use sha2::{Sha256, Digest};
+    let protocol_key = std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default();
     let second_key_valid = req.second_key.as_deref() == Some(&protocol_key) && !protocol_key.is_empty();
     if !second_key_valid { return Ok(Json(WithdrawVerifyResponse { withdraw_id: req.withdraw_id, status: "awaiting_second_key".to_string(), txid: None, btc_sent: None, pq_signature: None, message: "OTP verified. Provide second_key to authorize.".to_string() })); }
     let transfer_message = format!("{}:{}:{}", vault_id, destination_address, ubtc_amount);
@@ -1018,8 +1036,19 @@ async fn wallet_otp_verify(
     if status != "pending" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("OTP is {}", status)})))); }
     if chrono::Utc::now() > expires_at { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"OTP expired"})))); }
     if !verify_otp(&otp_secret, &req.otp_code, &otp_code) { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid OTP"})))); }
-    let protocol_key = std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default();
-    if req.second_key != protocol_key || protocol_key.is_empty() { return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid second key"})))); }
+  let vault_key_row = sqlx::query("SELECT protocol_key_hash FROM vaults WHERE id = $1")
+        .bind(&vault_id).fetch_optional(&pool).await.ok().flatten();
+    let stored_hash = vault_key_row.and_then(|r| r.try_get::<String, _>("protocol_key_hash").ok()).unwrap_or_default();
+    let env_key = std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default();
+   let key_valid = if !stored_hash.is_empty() {
+        use sha2::{Sha256, Digest};
+        let combined = format!("{}{}", req.second_key, "ubtc-psk-salt-2026");
+        let submitted_hash = hex::encode(Sha256::digest(combined.as_bytes()));
+        submitted_hash == stored_hash
+    } else {
+        req.second_key == env_key && !env_key.is_empty()
+    };
+    if !key_valid { return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid second key"})))); }
     let message = format!("{}:{}:{}", vault_id, destination, amount);
     let pq_sig = quantum_sign(&pq_secret_key, message.as_bytes()).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"quantum signing failed"}))))?;
     sqlx::query("UPDATE transfer_requests SET status = 'completed', verified_at = NOW(), pq_signature = $1 WHERE id = $2").bind(&pq_sig).bind(&req.otp_id).execute(&pool).await.ok();
