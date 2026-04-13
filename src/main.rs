@@ -84,8 +84,8 @@ fn hash_recovery_key(key: &str) -> String {
 }
 
 #[derive(Deserialize)] struct CreateVaultRequest { user_pubkey: String, network: Option<String>, recovery_blocks: Option<i32>, account_type: Option<String> }
-#[derive(Serialize)] struct CreateVaultResponse { vault_id: String, deposit_address: String, network: String, recovery_blocks: i32, account_type: String, protocol_second_key: String, qsk_public: String, qsk_private: String, sphincs_pk: String, sphincs_sk: String, kyber_pk: String, kyber_sk: String }
-#[derive(Serialize)] struct VaultStatus { vault_id: String, status: String, deposit_address: String, btc_amount_sats: i64, ubtc_minted: String, confirmations: i32, account_type: String }
+#[derive(Serialize)] struct CreateVaultResponse { vault_id: String, deposit_address: String, mast_address: Option<String>, network: String, recovery_blocks: i32, account_type: String, protocol_second_key: String, qsk_public: String, qsk_private: String, sphincs_pk: String, sphincs_sk: String, kyber_pk: String, kyber_sk: String }
+#[derive(Serialize)] struct VaultStatus { vault_id: String, status: String, deposit_address: String, btc_amount_sats: i64, ubtc_minted: String, confirmations: i32, account_type: String, mast_address: Option<String>, network: String }
 #[derive(Deserialize)] struct MintRequest { vault_id: String, ubtc_amount: String }
 #[derive(Serialize)] struct MintResponse { mint_id: String, vault_id: String, ubtc_minted: String, collateral_ratio: String, max_mintable: String, btc_price_usd: String }
 #[derive(Deserialize)] struct BurnRequest { vault_id: String, ubtc_to_burn: String }
@@ -369,7 +369,7 @@ async fn create_vault(
     Json(req): Json<CreateVaultRequest>,
 ) -> Result<Json<CreateVaultResponse>, StatusCode> {
     let vault_id = format!("vault_{}", &Uuid::new_v4().to_string()[..8]);
-    let network = req.network.unwrap_or_else(|| "regtest".to_string());
+ let network = req.network.unwrap_or_else(|| std::env::var("BITCOIN_NETWORK").unwrap_or_else(|_| "testnet4".to_string()));
     let recovery_blocks: i32 = req.recovery_blocks.unwrap_or(6);
     let account_type = req.account_type.unwrap_or_else(|| "current".to_string());
  // Generate Taproot (P2TR) deposit address — tb1p prefix
@@ -462,15 +462,14 @@ async fn create_vault(
         tracing::info!("MAST vault address built: {}", mast_addr);
     }
     tracing::info!("Created vault {} type={} with quantum keypair", vault_id, account_type);
-  Ok(Json(CreateVaultResponse { vault_id, deposit_address, network, recovery_blocks, account_type, protocol_second_key, qsk_public: qkp.public_key, qsk_private: qkp.secret_key, sphincs_pk, sphincs_sk, kyber_pk, kyber_sk }))
+Ok(Json(CreateVaultResponse { vault_id, deposit_address, mast_address, network, recovery_blocks, account_type, protocol_second_key, qsk_public: qkp.public_key, qsk_private: qkp.secret_key, sphincs_pk, sphincs_sk, kyber_pk, kyber_sk }))
 }
-
 
 async fn get_vault(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<VaultStatus>, StatusCode> {
-    let row = sqlx::query("SELECT id, status, deposit_address, btc_amount_sats, ubtc_minted, confirmations, account_type FROM vaults WHERE id = $1")
+    let row = sqlx::query("SELECT id, status, deposit_address, btc_amount_sats, ubtc_minted, confirmations, account_type, mast_address, network FROM vaults WHERE id = $1")
         .bind(&id).fetch_one(&pool).await.map_err(|_| StatusCode::NOT_FOUND)?;
     use sqlx::Row;
     Ok(Json(VaultStatus {
@@ -480,6 +479,8 @@ async fn get_vault(
         ubtc_minted: row.get("ubtc_minted"),
         confirmations: row.get("confirmations"),
         account_type: row.get("account_type"),
+        mast_address: row.try_get("mast_address").unwrap_or(None),
+        network: row.try_get("network").unwrap_or_else(|_| "testnet4".to_string()),
     }))
 }
 
@@ -847,7 +848,7 @@ async fn dashboard(
 ) -> Result<Json<DashboardResponse>, StatusCode> {
     use sqlx::Row;
     let rows = sqlx::query("SELECT id, status, deposit_address, btc_amount_sats, ubtc_minted, confirmations, account_type FROM vaults ORDER BY created_at DESC").fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let vaults: Vec<VaultStatus> = rows.iter().map(|row| VaultStatus { vault_id: row.get("id"), status: row.get("status"), deposit_address: row.get("deposit_address"), btc_amount_sats: row.get("btc_amount_sats"), ubtc_minted: row.get("ubtc_minted"), confirmations: row.get("confirmations"), account_type: row.get("account_type") }).collect();
+  let vaults: Vec<VaultStatus> = rows.iter().map(|row| VaultStatus { vault_id: row.get("id"), status: row.get("status"), deposit_address: row.get("deposit_address"), btc_amount_sats: row.get("btc_amount_sats"), ubtc_minted: row.get("ubtc_minted"), confirmations: row.get("confirmations"), account_type: row.get("account_type"), mast_address: row.try_get("mast_address").unwrap_or(None), network: row.try_get("network").unwrap_or_else(|_| "testnet4".to_string()) }).collect();
     let active_vaults = vaults.iter().filter(|v| v.status == "active").count() as i64;
     let total_btc_sats: i64 = vaults.iter().map(|v| v.btc_amount_sats).sum();
     let total_ubtc: Decimal = vaults.iter().map(|v| Decimal::from_str(&v.ubtc_minted).unwrap_or(dec!(0))).sum();
