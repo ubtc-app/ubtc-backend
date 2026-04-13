@@ -456,10 +456,30 @@ async fn create_vault(
             build_vault_mast(&user_pubkey_hex, &wlb_pubkey)
         } else { None }
     };
-    if let Some(ref mast_addr) = mast_address {
+   if let Some(ref mast_addr) = mast_address {
         sqlx::query("UPDATE vaults SET mast_address = $1 WHERE id = $2")
             .bind(mast_addr).bind(&vault_id).execute(&pool).await.ok();
         tracing::info!("MAST vault address built: {}", mast_addr);
+        // Import MAST address as watch-only into Bitcoin Core wallet
+  // Get descriptor checksum from Bitcoin Core first
+        let desc_str = format!("addr({})", mast_addr);
+        let desc_info = rpc_call("getdescriptorinfo", serde_json::json!([desc_str])).await;
+        let desc_with_checksum = if let Ok(info) = desc_info {
+            info["descriptor"].as_str().unwrap_or(&desc_str).to_string()
+        } else {
+            desc_str.clone()
+        };
+        let import_payload = serde_json::json!([[{
+            "desc": desc_with_checksum,
+            "timestamp": "now",
+            "label": format!("ubtc-vault-{}", vault_id),
+            "watchonly": true
+        }]]);
+        let import_result = rpc_call("importdescriptors", import_payload).await;
+        match import_result {
+            Ok(_) => tracing::info!("Imported MAST address {} as watch-only", mast_addr),
+            Err(e) => tracing::warn!("Could not import MAST address: {}", e),
+        }
     }
     tracing::info!("Created vault {} type={} with quantum keypair", vault_id, account_type);
 Ok(Json(CreateVaultResponse { vault_id, deposit_address, mast_address, network, recovery_blocks, account_type, protocol_second_key, qsk_public: qkp.public_key, qsk_private: qkp.secret_key, sphincs_pk, sphincs_sk, kyber_pk, kyber_sk }))
@@ -581,35 +601,82 @@ async fn scan_deposit(
         .map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"vault not found"}))))?;
     let deposit_address: String = row.get("deposit_address");
     let current_status: String = row.get("status");
-    // Ask Bitcoin Core what has been received at this address
-    let received = rpc_call("listreceivedbyaddress", serde_json::json!([0, true, true, deposit_address])).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
-    let entries = received.as_array().unwrap_or(&vec![]).clone();
-    let entry = entries.iter().find(|e| e["address"].as_str() == Some(&deposit_address));
-    if entry.is_none() {
+   // Get MAST address if available
+    let mast_address: Option<String> = sqlx::query("SELECT mast_address FROM vaults WHERE id = $1")
+        .bind(vault_id).fetch_one(&pool).await.ok()
+        .and_then(|r| r.try_get("mast_address").ok());
+
+    // Check both deposit address and MAST address
+    // First try Bitcoin Core for the deposit address
+    let mut amount_btc = 0.0f64;
+    let mut confirmations = 0i64;
+    let mut txid = String::new();
+    let mut vout = 0i32;
+    let mut found_address = deposit_address.clone();
+
+    // Try Bitcoin Core for deposit address
+    if let Ok(received) = rpc_call("listreceivedbyaddress", serde_json::json!([0, true, true, deposit_address])).await {
+        let entries = received.as_array().unwrap_or(&vec![]).clone();
+        if let Some(entry) = entries.iter().find(|e| e["address"].as_str() == Some(&deposit_address)) {
+            let btc = entry["amount"].as_f64().unwrap_or(0.0);
+            let confs = entry["confirmations"].as_i64().unwrap_or(0);
+            let txids = entry["txids"].as_array().cloned().unwrap_or_default();
+            if btc > 0.0 && !txids.is_empty() {
+                amount_btc = btc;
+                confirmations = confs;
+                txid = txids.last().and_then(|t| t.as_str()).unwrap_or("").to_string();
+                found_address = deposit_address.clone();
+                let tx_info = rpc_call("gettransaction", serde_json::json!([txid])).await.unwrap_or(serde_json::json!({}));
+                vout = tx_info["details"].as_array()
+                    .and_then(|d| d.iter().find(|x| x["address"].as_str() == Some(&deposit_address)))
+                    .and_then(|d| d["vout"].as_i64()).unwrap_or(0) as i32;
+            }
+        }
+    }
+
+    // If nothing found on deposit address, check MAST address via mempool.space
+    if amount_btc == 0.0 {
+        if let Some(ref mast_addr) = mast_address {
+            let network = std::env::var("BITCOIN_NETWORK").unwrap_or_else(|_| "testnet4".to_string());
+            let mempool_base = if network == "mainnet" {
+                "https://mempool.space/api".to_string()
+            } else {
+                "https://mempool.space/testnet4/api".to_string()
+            };
+            let client = reqwest::Client::new();
+            // Get UTXOs for MAST address
+            if let Ok(resp) = client.get(format!("{}/address/{}/utxo", mempool_base, mast_addr))
+                .send().await {
+                if let Ok(utxos) = resp.json::<serde_json::Value>().await {
+                    if let Some(utxo_arr) = utxos.as_array() {
+                        if let Some(utxo) = utxo_arr.first() {
+                            let sats = utxo["value"].as_i64().unwrap_or(0);
+                            if sats > 0 {
+                                amount_btc = sats as f64 / 100_000_000.0;
+                                confirmations = if utxo["status"]["confirmed"].as_bool().unwrap_or(false) { 1 } else { 0 };
+                                txid = utxo["txid"].as_str().unwrap_or("").to_string();
+                                vout = utxo["vout"].as_i64().unwrap_or(0) as i32;
+                                found_address = mast_addr.clone();
+                                tracing::info!("Found {} BTC at MAST address {}", amount_btc, mast_addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if amount_btc == 0.0 || txid.is_empty() {
         return Ok(Json(serde_json::json!({"found": false, "message": "No BTC received at this address yet"})));
     }
-    let entry = entry.unwrap();
-    let amount_btc = entry["amount"].as_f64().unwrap_or(0.0);
-    let confirmations = entry["confirmations"].as_i64().unwrap_or(0);
-    let txids = entry["txids"].as_array().cloned().unwrap_or_default();
-    if amount_btc == 0.0 || txids.is_empty() {
-        return Ok(Json(serde_json::json!({"found": false, "message": "No confirmed BTC found"})));
-    }
-    let txid = txids.last().and_then(|t| t.as_str()).unwrap_or("").to_string();
     let amount_sats = (amount_btc * 100_000_000.0) as i64;
-    // Get transaction details to find vout
-    let tx_info = rpc_call("gettransaction", serde_json::json!([txid])).await.unwrap_or(serde_json::json!({}));
-    let vout = tx_info["details"].as_array()
-        .and_then(|d| d.iter().find(|x| x["address"].as_str() == Some(&deposit_address)))
-        .and_then(|d| d["vout"].as_i64()).unwrap_or(0) as i32;
     // Check if we already recorded this UTXO
     let existing = sqlx::query("SELECT id FROM vault_utxos WHERE vault_id = $1 AND txid = $2")
         .bind(vault_id).bind(&txid).fetch_optional(&pool).await.unwrap_or(None);
     if existing.is_none() {
         let utxo_id = format!("utxo_{}", &Uuid::new_v4().to_string()[..8]);
         sqlx::query("INSERT INTO vault_utxos (id, vault_id, txid, vout, amount_sats, vault_address, spent, created_at) VALUES ($1, $2, $3, $4, $5, $6, false, NOW())")
-            .bind(&utxo_id).bind(vault_id).bind(&txid).bind(vout).bind(amount_sats).bind(&deposit_address)
+            .bind(&utxo_id).bind(vault_id).bind(&txid).bind(vout).bind(amount_sats).bind(&found_address)
             .execute(&pool).await.ok();
         sqlx::query("UPDATE vaults SET btc_amount_sats = $1, confirmations = $2, status = 'active', utxo_txid = $3 WHERE id = $4")
             .bind(amount_sats).bind(confirmations as i32).bind(&txid).bind(vault_id)
