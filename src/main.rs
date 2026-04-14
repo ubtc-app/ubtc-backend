@@ -93,7 +93,7 @@ fn hash_recovery_key(key: &str) -> String {
 #[derive(Deserialize)] struct DepositRequest { vault_id: String, amount_btc: String }
 #[derive(Serialize)] struct DepositResponse { txid: String, vault_id: String, amount_btc: String, deposit_address: String }
 #[derive(Serialize)] struct DashboardResponse { active_vaults: i64, total_btc_sats: i64, total_ubtc_minted: String, btc_price_usd: String, vaults: Vec<VaultStatus> }
-#[derive(Deserialize)] struct TransferRequest { from_vault_id: String, to_address: String, ubtc_amount: String, pq_signature: Option<String> }
+#[derive(Deserialize)] struct TransferRequest { from_vault_id: String, to_address: String, ubtc_amount: String, pq_signature: Option<String>, client_taproot_pubkey: Option<String>, client_taproot_key_encrypted: Option<String> }
 #[derive(Deserialize)] struct SignPayloadRequest { private_key: String, payload: String }
 #[derive(Serialize)] struct SignPayloadResponse { signature: String }
 #[derive(Serialize)] struct TransferResponse { transfer_id: String, from_vault_id: String, to_address: String, ubtc_amount: String, taproot_placeholder: bool, message: String }
@@ -902,14 +902,14 @@ async fn transfer_ubtc(
         let wallet_balance: String = wallet_row.get("balance");
         let to_user_id: String = wallet_row.get("user_id");
         let new_balance = Decimal::from_str(&wallet_balance).unwrap_or(dec!(0)) + amount;
-        sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2")
+       sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2")
             .bind(new_balance.to_string()).bind(&wallet_id).execute(&pool).await.ok();
         let wtx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
-        sqlx::query("INSERT INTO wallet_transactions (id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'received', 'UBTC received from transfer', 'completed', NOW())")
-            .bind(&wtx_id).bind(&to_user_id).bind(amount.to_string()).execute(&pool).await.ok();
-        tracing::info!("Credited wallet {} with {} UBTC", req.to_address, amount);
-    }
- // Transfer the 1-sat UTXO anchor on Bitcoin
+        sqlx::query("INSERT INTO wallet_transactions (id, from_vault_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'received', 'UBTC received from transfer', 'completed', NOW())")
+            .bind(&wtx_id).bind(&vault_id).bind(&to_user_id).bind(amount.to_string()).execute(&pool).await.ok();
+  } // end credit wallet
+
+    // Transfer the 1-sat UTXO anchor on Bitcoin
     let anchor_row = sqlx::query(
         "SELECT id, txid, vout, anchor_address FROM ubtc_anchors WHERE vault_id = $1 AND spent = false ORDER BY created_at DESC LIMIT 1"
     ).bind(&vault_id).fetch_optional(&pool).await.unwrap_or(None);
@@ -1011,7 +1011,11 @@ async fn transfer_ubtc(
                 "redemption_template": {
                     "type": "kyber_encrypted",
                     "note": "Decrypt with KEY 3 (Kyber) to get taproot_secret_key for Bitcoin redemption",
-                   "taproot_secret_key_encrypted": taproot_secret_key.unwrap_or_default(),
+                "taproot_secret_key_encrypted": req.client_taproot_key_encrypted.as_deref()
+                       .filter(|k| !k.is_empty())
+                       .map(|k| k.to_string())
+                       .unwrap_or_else(|| taproot_secret_key.clone().unwrap_or_default()),
+                   "client_taproot_pubkey": req.client_taproot_pubkey.as_deref().unwrap_or(""),
                 "note_on_encryption": "In production this field is Kyber-encrypted with recipient KEY 3. Currently stores raw key for testnet development.",
                     "signing_path": "key_path",
                     "rbf_enabled": true,
@@ -1051,9 +1055,10 @@ async fn transfer_ubtc(
                 }
         }
     }
+Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred with Bitcoin anchor UTXO. Proof file generated for recipient.".to_string() }))
 
-    Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred with Bitcoin anchor UTXO. Proof file generated for recipient.".to_string() }))
 }
+
 async fn redeem_proof(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     Json(req): Json<serde_json::Value>,
@@ -1088,13 +1093,21 @@ async fn redeem_proof(
     let tsk = if tsk.len() == 65 { tsk[1..].to_string() } else { tsk };
 
     // Calculate amount to release (proportional to ubtc burned)
-    let ubtc_f = ubtc_amount.parse::<f64>().unwrap_or(0.0);
+   let ubtc_f = ubtc_amount.parse::<f64>().unwrap_or(0.0);
     let fee_sats = fee_rate * 200;
-    let release_sats = (ubtc_f / 100.0 * btc_amount_sats as f64) as i64 - fee_sats;
+    // Release proportional BTC based on UBTC amount vs total minted
+    let vault_ubtc_total: f64 = sqlx::query("SELECT ubtc_minted FROM vaults WHERE id = $1")
+        .bind(vault_id).fetch_one(&pool).await
+        .ok().and_then(|r| r.try_get::<String, _>("ubtc_minted").ok())
+        .and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let release_sats = ((ubtc_f / vault_ubtc_total) * btc_amount_sats as f64) as i64 - fee_sats;
 
     if release_sats < 546 {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("release amount {} sats is below dust limit after fees", release_sats)}))));
+        // Use sendtoaddress fallback for small amounts — Lightning will replace this
+        let small_btc = (ubtc_f / 100.0 * 0.000_015) as f64;
+        let _ = rpc_call("sendtoaddress", serde_json::json!([destination, small_btc.max(0.000_00546)])).await;
     }
+    let release_sats = release_sats.max(546);
 // Bitcoin Core holds keys for vault deposit address — use sendtoaddress
     let send_btc = release_sats as f64 / 100_000_000.0;
     let txid_val = rpc_call("sendtoaddress", serde_json::json!([destination, send_btc])).await
@@ -1589,8 +1602,102 @@ async fn send_from_wallet(
         let new_recipient_balance = Decimal::from_str(&recipient_balance).unwrap_or(dec!(0)) + amount;
         sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2").bind(new_sender_balance.to_string()).bind(&sender_wallet_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
         sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2").bind(new_recipient_balance.to_string()).bind(&recipient_wallet_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-        sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'internal', 'Internal UBTC transfer', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(&recipient_user_id).bind(amount.to_string()).execute(&pool).await.ok();
-        Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. BTC collateral unchanged.".to_string() }))
+       sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'internal', 'Internal UBTC transfer', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(&recipient_user_id).bind(amount.to_string()).execute(&pool).await.ok();
+
+        // Generate proof file for recipient — find backing vault from sender's linked vault or transaction history
+        let backing_vault_id = if !linked_vault_id.is_empty() {
+            linked_vault_id.clone()
+        } else {
+            // Find vault from sender's received transactions
+            sqlx::query("SELECT from_vault_id FROM wallet_transactions WHERE to_user_id = $1 AND from_vault_id IS NOT NULL ORDER BY created_at DESC LIMIT 1")
+                .bind(sender.get::<String, _>("user_id")).fetch_optional(&pool).await.unwrap_or(None)
+                .and_then(|r| r.try_get::<String, _>("from_vault_id").ok())
+                .unwrap_or_default()
+        };
+
+        if !backing_vault_id.is_empty() {
+            if let Ok(vault_row) = sqlx::query(
+                "SELECT deposit_address, mast_address, taproot_secret_key, btc_amount_sats FROM vaults WHERE id = $1"
+            ).bind(&backing_vault_id).fetch_one(&pool).await {
+                let deposit_address: String = vault_row.get("deposit_address");
+                let mast_address: Option<String> = vault_row.try_get("mast_address").unwrap_or(None);
+                let taproot_secret_key: Option<String> = vault_row.try_get("taproot_secret_key").unwrap_or(None);
+                let btc_amount_sats: i64 = vault_row.get("btc_amount_sats");
+
+                if let Ok(recipient_wallet_row) = sqlx::query(
+                    "SELECT public_key FROM ubtc_wallets WHERE wallet_address = (SELECT wallet_address FROM ubtc_users WHERE id = $1)"
+                ).bind(&recipient_user_id).fetch_one(&pool).await {
+                    let recipient_pk: String = recipient_wallet_row.get("public_key");
+                    let proof_id = format!("prf_{}", &Uuid::new_v4().to_string()[..12]);
+                    let nullifier_preimage = format!("{}:{}:{}", proof_id, recipient_pk, tx_id);
+                    use sha2::{Sha256, Digest};
+                    let mut hasher = Sha256::new();
+                    hasher.update(nullifier_preimage.as_bytes());
+                    let nullifier_hash = hex::encode(hasher.finalize());
+                    let btc_release_sats = (amount.to_string().parse::<f64>().unwrap_or(0.0) / 100.0 * 0.015 * 100_000_000.0) as i64;
+                    let recipient_wallet_address: String = sqlx::query("SELECT wallet_address FROM ubtc_users WHERE id = $1")
+                        .bind(&recipient_user_id).fetch_one(&pool).await.ok()
+                        .and_then(|r| r.try_get("wallet_address").ok()).unwrap_or_default();
+
+                    let proof_data = serde_json::json!({
+                        "version": "UBTCV1",
+                        "proof_id": proof_id,
+                        "created_at": chrono::Utc::now().timestamp(),
+                        "expires_at": chrono::Utc::now().timestamp() + 31536000,
+                        "collateral": {
+                            "vault_id": backing_vault_id,
+                            "vault_address": mast_address.unwrap_or(deposit_address),
+                            "vault_utxo_amount_sats": btc_amount_sats,
+                        },
+                        "ownership": {
+                            "ubtc_amount": amount.to_string(),
+                            "btc_release_sats": btc_release_sats,
+                            "owner_dilithium_pk": recipient_pk,
+                            "wallet_address": recipient_wallet_address,
+                        },
+                        "nullifier": {
+                            "hash": nullifier_hash,
+                            "bitcoin_prefix": "UBTCN1:",
+                            "redeemed": false,
+                            "redemption_txid": null
+                        },
+                        "redemption_template": {
+                            "type": "kyber_encrypted",
+                            "note": "Decrypt with KEY 3 (Kyber) to get taproot_secret_key for Bitcoin redemption",
+                            "taproot_secret_key_encrypted": taproot_secret_key.unwrap_or_default(),
+                            "signing_path": "key_path",
+                            "rbf_enabled": true,
+                            "fee_note": "Calculate fee at redemption time — do NOT pre-sign"
+                        },
+                        "ownership_chain": [{
+                            "step": 0,
+                            "type": "wallet_transfer",
+                            "from": req.from_address,
+                            "to": recipient_wallet_address,
+                            "amount": amount.to_string(),
+                            "timestamp": chrono::Utc::now().timestamp()
+                        }],
+                        "broadcast_endpoints": [
+                            "https://mempool.space/testnet4/api/tx",
+                            "https://blockstream.info/testnet/api/tx",
+                            "manual"
+                        ],
+                        "integrity": { "proof_hash": nullifier_hash }
+                    });
+
+                    let proof_db_id = format!("proof_{}", &Uuid::new_v4().to_string()[..8]);
+                    sqlx::query(
+                        "INSERT INTO ubtc_proofs (id, proof_id, sender_vault_id, recipient_wallet_address, proof_data, downloaded, created_at) VALUES ($1, $2, $3, $4, $5, false, NOW())"
+                    )
+                        .bind(&proof_db_id).bind(&proof_id).bind(&backing_vault_id)
+                        .bind(&recipient_wallet_address).bind(&proof_data)
+                        .execute(&pool).await.ok();
+                   tracing::info!("Proof generated for wallet transfer: {} -> {}", req.from_address, recipient_wallet_address);
+                }
+            }
+        }
+
+ return Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. Proof file generated for recipient.".to_string() }));
     } else {
         if linked_vault_id.is_empty() { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No linked vault. External sends require a vault-linked wallet."})))); }
         let vault_row = sqlx::query("SELECT ubtc_minted, btc_amount_sats, status FROM vaults WHERE id = $1").bind(&linked_vault_id).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"linked vault not found"}))))?;
