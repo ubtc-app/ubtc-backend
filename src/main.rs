@@ -1060,20 +1060,54 @@ Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req
 
 }
 
-async fn lnd_create_invoice(amount_sats: i64, memo: &str) -> Result<String, String> {
+async fn lnurl_fetch_invoice(lightning_address: &str, amount_msats: i64) -> Result<String, String> {
+    // Lightning address format: user@domain.com
+    let parts: Vec<&str> = lightning_address.split('@').collect();
+    if parts.len() != 2 { return Err("Invalid Lightning address format".to_string()); }
+    let (user, domain) = (parts[0], parts[1]);
+    let lnurl_endpoint = format!("https://{}/.well-known/lnurlp/{}", domain, user);
+    let client = reqwest::Client::new();
+    // Step 1 — fetch LNURL-pay metadata
+    let meta_res = client.get(&lnurl_endpoint).send().await.map_err(|e| e.to_string())?;
+    let meta: serde_json::Value = meta_res.json().await.map_err(|e| e.to_string())?;
+    if meta["status"].as_str() == Some("ERROR") {
+        return Err(meta["reason"].as_str().unwrap_or("LNURL error").to_string());
+    }
+    let callback = meta["callback"].as_str().ok_or("No callback in LNURL response")?;
+    let min_msats = meta["minSendable"].as_i64().unwrap_or(1000);
+    let max_msats = meta["maxSendable"].as_i64().unwrap_or(1_000_000_000);
+    let amount_msats = amount_msats.max(min_msats).min(max_msats);
+    // Step 2 — fetch invoice from callback
+    let invoice_url = format!("{}?amount={}", callback, amount_msats);
+    let inv_res = client.get(&invoice_url).send().await.map_err(|e| e.to_string())?;
+    let inv: serde_json::Value = inv_res.json().await.map_err(|e| e.to_string())?;
+    if inv["status"].as_str() == Some("ERROR") {
+        return Err(inv["reason"].as_str().unwrap_or("Invoice error").to_string());
+    }
+    inv["pr"].as_str().map(|s| s.to_string()).ok_or("No invoice in response".to_string())
+}
+
+async fn lnd_pay_invoice(payment_request: &str) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build().map_err(|e| e.to_string())?;
     let macaroon = std::fs::read("C:\\lnd\\data\\data\\chain\\bitcoin\\testnet4\\admin.macaroon")
         .map_err(|e| format!("macaroon read error: {}", e))?;
     let macaroon_hex = hex::encode(&macaroon);
-    let body = serde_json::json!({ "value": amount_sats, "memo": memo, "expiry": 3600 });
-    let res = client.post("https://127.0.0.1:8092/v1/invoices")
+    let body = serde_json::json!({
+        "payment_request": payment_request,
+        "timeout_seconds": 60,
+        "fee_limit_sat": 100,
+    });
+    let res = client.post("https://127.0.0.1:8092/v1/channels/transactions")
         .header("Grpc-Metadata-macaroon", &macaroon_hex)
         .json(&body).send().await.map_err(|e| e.to_string())?;
     let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-    data["payment_request"].as_str().map(|s| s.to_string())
-        .ok_or_else(|| format!("no payment_request in response: {:?}", data))
+    if data["payment_error"].as_str().unwrap_or("").is_empty() {
+        Ok(data)
+    } else {
+        Err(data["payment_error"].as_str().unwrap_or("unknown error").to_string())
+    }
 }
 
 async fn redeem_proof_lightning(
@@ -1083,27 +1117,77 @@ async fn redeem_proof_lightning(
     use sqlx::Row;
     let proof_id = req["proof_id"].as_str().unwrap_or("");
     let ubtc_amount = req["ubtc_amount"].as_str().unwrap_or("0");
-    let amount_f: f64 = ubtc_amount.parse().unwrap_or(0.0);
-    // Convert UBTC to sats (1 UBTC = 1 USD worth of BTC)
-    let btc_price = fetch_btc_price().await.unwrap_or(dec!(65000));
-    let btc_price_f: f64 = btc_price.to_string().parse().unwrap_or(65000.0);
-    let amount_sats = ((amount_f / btc_price_f) * 100_000_000.0) as i64;
-    if amount_sats < 1 {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "amount too small"}))));
+    let mut payment_request = req["payment_request"].as_str().unwrap_or("").to_string();
+    let lightning_address = req["lightning_address"].as_str().unwrap_or("");
+    if payment_request.is_empty() && lightning_address.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "lightning_address or payment_request is required"}))));
     }
-    let memo = format!("UBTC redemption {} — proof {}", ubtc_amount, proof_id);
-    match lnd_create_invoice(amount_sats, &memo).await {
-        Ok(payment_request) => {
+    // If Lightning address provided, resolve it to an invoice
+    if !lightning_address.is_empty() {
+        let btc_price = fetch_btc_price().await.unwrap_or(dec!(65000));
+        let btc_price_f: f64 = btc_price.to_string().parse().unwrap_or(65000.0);
+        let ubtc_f: f64 = ubtc_amount.parse().unwrap_or(0.0);
+        let amount_sats = ((ubtc_f / btc_price_f) * 100_000_000.0) as i64;
+        let fee_percent = std::env::var("LND_FEE_PERCENT").unwrap_or("1".to_string()).parse::<i64>().unwrap_or(1);
+        let fee_cap = std::env::var("LND_FEE_CAP_SATS").unwrap_or("100".to_string()).parse::<i64>().unwrap_or(100);
+        let fee_sats_est = (amount_sats * fee_percent / 100).min(fee_cap).max(1);
+        let net_sats = amount_sats - fee_sats_est;
+        let amount_msats = net_sats * 1000;
+    match lnurl_fetch_invoice(lightning_address, amount_msats).await {
+            Ok(pr) => payment_request = pr,
+            Err(e) => return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Lightning address error: {}", e)})))),
+        }
+    }
+    
+    if proof_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "proof_id is required"}))));
+    }
+    // Decode invoice to get amount
+    let client = reqwest::Client::builder().danger_accept_invalid_certs(true).build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    let macaroon = std::fs::read("C:\\lnd\\data\\data\\chain\\bitcoin\\testnet4\\admin.macaroon")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    let macaroon_hex = hex::encode(&macaroon);
+    let decode_res = client.get(format!("https://127.0.0.1:8092/v1/payreq/{}", payment_request))
+        .header("Grpc-Metadata-macaroon", &macaroon_hex)
+        .send().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    let decoded: serde_json::Value = decode_res.json().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    let invoice_sats = decoded["num_satoshis"].as_str()
+        .and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    if invoice_sats < 1 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invoice amount must be greater than 0"}))));
+    }
+    // Calculate fee (1% capped at 100 sats)
+    let fee_percent = std::env::var("LND_FEE_PERCENT").unwrap_or("1".to_string()).parse::<i64>().unwrap_or(1);
+    let fee_cap = std::env::var("LND_FEE_CAP_SATS").unwrap_or("100".to_string()).parse::<i64>().unwrap_or(100);
+    let fee_sats = (invoice_sats * fee_percent / 100).min(fee_cap).max(1);
+    let total_sats = invoice_sats + fee_sats;
+    // Burn UBTC from proof
+    let ubtc_f: f64 = ubtc_amount.parse().unwrap_or(0.0);
+    if ubtc_f <= 0.0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid ubtc_amount"}))));
+    }
+    // Mark proof as redeemed
+    sqlx::query("UPDATE ubtc_proofs SET downloaded = true WHERE proof_id = $1")
+        .bind(proof_id).execute(&pool).await.ok();
+    // Pay the invoice via LND
+    match lnd_pay_invoice(&payment_request).await {
+        Ok(result) => {
+            let payment_hash = result["payment_hash"].as_str().unwrap_or("").to_string();
+            tracing::info!("Lightning redemption: {} sats paid, hash={}", total_sats, payment_hash);
             Ok(Json(serde_json::json!({
-                "payment_request": payment_request,
-                "amount_sats": amount_sats,
-                "ubtc_amount": ubtc_amount,
+                "success": true,
+                "payment_hash": payment_hash,
+                "amount_sats": invoice_sats,
+                "fee_sats": fee_sats,
+                "ubtc_burned": ubtc_amount,
                 "proof_id": proof_id,
-                "expires_in": 3600,
-                "method": "lightning"
+                "method": "lightning",
+                "message": format!("✅ {} sats sent via Lightning! Fee: {} sats.", invoice_sats, fee_sats)
             })))
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("LND error: {}", e)}))))
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Payment failed: {}", e)}))))
     }
 }
 
