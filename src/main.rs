@@ -427,9 +427,12 @@ async fn create_vault(
     let (kyber_pk_raw, kyber_sk_raw) = kyber1024::keypair();
     let kyber_pk = hex::encode(kyber_pk_raw.as_bytes());
     let kyber_sk = hex::encode(kyber_sk_raw.as_bytes());
-    // Store public key in vault for transfer verification
+  // Store public key in vault for transfer verification
     sqlx::query("UPDATE vaults SET user_pubkey = $1 WHERE id = $2")
         .bind(&qkp.public_key).bind(&vault_id).execute(&pool).await.ok();
+    // Store Kyber public key in wallet for proof encryption
+    sqlx::query("UPDATE ubtc_wallets SET kyber_pk = $1 WHERE linked_vault_id = $2")
+        .bind(&kyber_pk).bind(&vault_id).execute(&pool).await.ok();
     // Build Taproot MAST vault address with spending paths
     // Generate a secp256k1 keypair for the Taproot internal key
     let mast_address = {
@@ -498,7 +501,7 @@ async fn create_vault(
             Err(e) => tracing::error!("Failed to create user record: {}", e),
         }
     match sqlx::query(
-        "INSERT INTO ubtc_wallets (id, user_id, wallet_name, wallet_address, public_key, balance, linked_vault_id, created_at) VALUES ($1, $2, $3, $4, $5, '0', $6, NOW())"
+       "INSERT INTO ubtc_wallets (id, user_id, wallet_name, wallet_address, public_key, balance, linked_vault_id, kyber_pk, created_at) VALUES ($1, $2, $3, $4, $5, '0', $6, $7, NOW())"
     )
         .bind(format!("wal_{}", &uuid::Uuid::new_v4().to_string()[..8]))
         .bind(&user_id)
@@ -506,6 +509,7 @@ async fn create_vault(
         .bind(&wallet_address)
         .bind(&qkp.public_key)
         .bind(&vault_id)
+        .bind(&kyber_pk)
         .execute(&pool).await {
             Ok(_) => tracing::info!("Created vault {} with auto-linked wallet {}", vault_id, wallet_address),
             Err(e) => tracing::error!("Failed to create auto-wallet: {}", e),
@@ -979,8 +983,21 @@ async fn transfer_ubtc(
             let mut hasher = Sha256::new();
             hasher.update(nullifier_preimage.as_bytes());
             let nullifier_hash = hex::encode(hasher.finalize());
-            // Build proof JSON
+           // Build proof JSON
             let btc_release_sats = (amount.to_string().parse::<f64>().unwrap_or(0.0) / 100.0 * 0.015 * 100_000_000.0) as i64;
+            let raw_taproot = taproot_secret_key.clone().unwrap_or_default();
+            let recipient_kyber_pk_for_proof: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets WHERE wallet_address = $1")
+                .bind(&req.to_address).fetch_optional(&pool).await.ok().flatten()
+                .and_then(|r| r.try_get::<String, _>("kyber_pk").ok()).unwrap_or_default();
+            let (wallet_taproot_encrypted, wallet_encryption) = if !recipient_kyber_pk_for_proof.is_empty() && !raw_taproot.is_empty() {
+                match kyber_encrypt_for_recipient(raw_taproot.as_bytes(), &recipient_kyber_pk_for_proof) {
+                    Ok(enc) => { tracing::info!("Kyber1024 transfer proof SUCCESS"); (enc, "kyber1024") },
+                    Err(e) => { tracing::error!("Kyber1024 transfer proof FAILED: {}", e); (raw_taproot.clone(), "none") },
+                }
+            } else {
+                tracing::warn!("Kyber transfer proof skipped: pk_empty={}", recipient_kyber_pk_for_proof.is_empty());
+                (raw_taproot.clone(), "none")
+            };
             let proof_data = serde_json::json!({
                 "version": "UBTCV1",
                 "proof_id": proof_id,
@@ -1003,18 +1020,15 @@ async fn transfer_ubtc(
                     "redeemed": false,
                     "redemption_txid": null
                 },
-                "redemption_template": {
-                    "type": "kyber_encrypted",
-                    "note": "Decrypt with KEY 3 (Kyber) to get taproot_secret_key for Bitcoin redemption",
-              "taproot_secret_key_encrypted": taproot_secret_key.unwrap_or_default(),
-                   "encryption": "none",
-                   "client_taproot_pubkey": req.client_taproot_pubkey.as_deref().unwrap_or(""),
-                "note_on_encryption": "In production this field is Kyber-encrypted with recipient KEY 3. Currently stores raw key for testnet development.",
-                    "signing_path": "key_path",
-                    "rbf_enabled": true,
-                    "anchor_utxo": anchor_txid_for_proof,
-                    "fee_note": "Calculate fee at redemption time — do NOT pre-sign"
-                },
+               "redemption_template": {
+                            "type": "kyber_encrypted",
+                            "note": "Decrypt with KEY 3 (Kyber) to get taproot_secret_key for Bitcoin redemption",
+                           "taproot_secret_key_encrypted": wallet_taproot_encrypted,
+                            "encryption": wallet_encryption,
+                            "signing_path": "key_path",
+                            "rbf_enabled": true,
+                            "fee_note": "Calculate fee at redemption time — do NOT pre-sign"
+                        },
                 "ownership_chain": [{
                     "step": 0,
                     "type": "transfer",
@@ -1082,6 +1096,11 @@ async fn lnurl_fetch_invoice(lightning_address: &str, amount_msats: i64) -> Resu
 // Real Kyber1024 KEM encryption of proof taproot key
 // Returns: hex(kyber_ciphertext) + ":" + hex(nonce) + ":" + hex(encrypted_data) + ":" + hex(auth_tag)
 fn kyber_encrypt_for_recipient(plaintext: &[u8], recipient_kyber_pk_hex: &str) -> Result<String, String> {
+    // Real Kyber1024 pk is 1568 bytes = 3136 hex chars
+    // Old fake keys are 32 bytes = 64 hex chars — fall back to XOR for those
+    if recipient_kyber_pk_hex.len() < 3136 {
+        return Err("Not a real Kyber1024 key — use new account".to_string());
+    }
     use pqcrypto_kyber::kyber1024;
     use pqcrypto_traits::kem::{PublicKey as KemPk, Ciphertext as KemCt, SharedSecret as KemSs};
     use sha2::{Sha256, Digest};
@@ -1850,18 +1869,32 @@ async fn send_from_wallet(
                     let recipient_wallet_address: String = sqlx::query("SELECT wallet_address FROM ubtc_users WHERE id = $1")
                         .bind(&recipient_user_id).fetch_one(&pool).await.ok()
                         .and_then(|r| r.try_get("wallet_address").ok()).unwrap_or_default();
-let recipient_kyber_pk: String = sqlx::query("SELECT public_key FROM ubtc_wallets WHERE wallet_address = $1")
-                .bind(&req.to_username_or_address).fetch_optional(&pool).await.ok().flatten()
-                        .and_then(|r| r.try_get::<String, _>("public_key").ok())
+let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets WHERE wallet_address = $1")
+                        .bind(&req.to_username_or_address).fetch_optional(&pool).await.ok().flatten()
+                        .and_then(|r| r.try_get::<String, _>("kyber_pk").ok())
                         .unwrap_or_default();
                     let raw_taproot_key = taproot_secret_key.clone().unwrap_or_default();
-                    let (taproot_key_encrypted, encryption_method) = if !recipient_kyber_pk.is_empty() && !raw_taproot_key.is_empty() {
+                   let (taproot_key_encrypted, encryption_method) = if !recipient_kyber_pk.is_empty() && !raw_taproot_key.is_empty() {
                         match kyber_encrypt_for_recipient(raw_taproot_key.as_bytes(), &recipient_kyber_pk) {
-                            Ok(enc) => (enc, "kyber1024"),
-                            Err(_) => (raw_taproot_key.clone(), "none"),
+                            Ok(enc) => { tracing::info!("Kyber1024 encryption SUCCESS pk_len={}", recipient_kyber_pk.len()); (enc, "kyber1024") },
+                            Err(e) => { tracing::error!("Kyber1024 FAILED: {}", e); (raw_taproot_key.clone(), "none") },
                         }
                     } else {
+                        tracing::warn!("Kyber skipped: pk_empty={} key_empty={}", recipient_kyber_pk.is_empty(), raw_taproot_key.is_empty());
                         (raw_taproot_key.clone(), "none")
+                    };
+                    let raw_taproot = taproot_secret_key.clone().unwrap_or_default();
+                    let recipient_wallet_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets WHERE wallet_address = $1")
+                        .bind(&recipient_wallet_address).fetch_optional(&pool).await.ok().flatten()
+                        .and_then(|r| r.try_get::<String, _>("kyber_pk").ok()).unwrap_or_default();
+                    let (wallet_taproot_encrypted, wallet_encryption) = if !recipient_wallet_kyber_pk.is_empty() && !raw_taproot.is_empty() {
+                        match kyber_encrypt_for_recipient(raw_taproot.as_bytes(), &recipient_wallet_kyber_pk) {
+                            Ok(enc) => { tracing::info!("Kyber1024 wallet proof encryption SUCCESS"); (enc, "kyber1024") },
+                            Err(e) => { tracing::error!("Kyber1024 wallet proof FAILED: {}", e); (raw_taproot.clone(), "none") },
+                        }
+                    } else {
+                        tracing::warn!("Kyber wallet proof skipped: kyber_pk_empty={}", recipient_wallet_kyber_pk.is_empty());
+                        (raw_taproot.clone(), "none")
                     };
                     let proof_data = serde_json::json!({
                         "version": "UBTCV1",
@@ -1888,7 +1921,8 @@ let recipient_kyber_pk: String = sqlx::query("SELECT public_key FROM ubtc_wallet
                         "redemption_template": {
                             "type": "kyber_encrypted",
                             "note": "Decrypt with KEY 3 (Kyber) to get taproot_secret_key for Bitcoin redemption",
-                            "taproot_secret_key_encrypted": taproot_secret_key.unwrap_or_default(),
+                          "taproot_secret_key_encrypted": wallet_taproot_encrypted,
+                            "encryption": wallet_encryption,
                             "signing_path": "key_path",
                             "rbf_enabled": true,
                             "fee_note": "Calculate fee at redemption time — do NOT pre-sign"
