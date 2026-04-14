@@ -1588,6 +1588,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pqcrypto-kyber"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15c00293cf898859d0c771455388054fd69ab712263c73fdc7f287a39b1ba000"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
+ "pqcrypto-internals",
+ "pqcrypto-traits",
+]
+
+[[package]]
 name = "pqcrypto-sphincsplus"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2842,6 +2855,7 @@ dependencies = [
  "dotenvy",
  "hex",
  "pqcrypto-dilithium",
+ "pqcrypto-kyber",
  "pqcrypto-sphincsplus 0.6.4",
  "pqcrypto-traits",
  "rand 0.8.5",

@@ -421,18 +421,12 @@ async fn create_vault(
     rand::thread_rng().fill_bytes(&mut sphincs_pk_bytes);
     let sphincs_pk = hex::encode(&sphincs_pk_bytes);
     let sphincs_sk = hex::encode(&sphincs_sk_bytes);
-    // Generate Kyber keypair
-    let mut kyber_sk_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut kyber_sk_bytes);
-    let kyber_pk_bytes = {
-        use sha2::{Sha256, Digest};
-        let mut h = Sha256::new();
-        h.update(&kyber_sk_bytes);
-        h.update(b"KYBER_PK_DERIVE_V1");
-        h.finalize()
-    };
-    let kyber_pk = hex::encode(&kyber_pk_bytes);
-    let kyber_sk = hex::encode(&kyber_sk_bytes);
+  // Generate REAL Kyber1024 keypair (NIST post-quantum KEM standard)
+    use pqcrypto_kyber::kyber1024;
+    use pqcrypto_traits::kem::{PublicKey as KemPk, SecretKey as KemSk};
+    let (kyber_pk_raw, kyber_sk_raw) = kyber1024::keypair();
+    let kyber_pk = hex::encode(kyber_pk_raw.as_bytes());
+    let kyber_sk = hex::encode(kyber_sk_raw.as_bytes());
     // Store public key in vault for transfer verification
     sqlx::query("UPDATE vaults SET user_pubkey = $1 WHERE id = $2")
         .bind(&qkp.public_key).bind(&vault_id).execute(&pool).await.ok();
@@ -1012,10 +1006,8 @@ async fn transfer_ubtc(
                 "redemption_template": {
                     "type": "kyber_encrypted",
                     "note": "Decrypt with KEY 3 (Kyber) to get taproot_secret_key for Bitcoin redemption",
-                "taproot_secret_key_encrypted": req.client_taproot_key_encrypted.as_deref()
-                       .filter(|k| !k.is_empty())
-                       .map(|k| k.to_string())
-                       .unwrap_or_else(|| taproot_secret_key.clone().unwrap_or_default()),
+              "taproot_secret_key_encrypted": taproot_secret_key.unwrap_or_default(),
+                   "encryption": "none",
                    "client_taproot_pubkey": req.client_taproot_pubkey.as_deref().unwrap_or(""),
                 "note_on_encryption": "In production this field is Kyber-encrypted with recipient KEY 3. Currently stores raw key for testnet development.",
                     "signing_path": "key_path",
@@ -1085,6 +1077,94 @@ async fn lnurl_fetch_invoice(lightning_address: &str, amount_msats: i64) -> Resu
         return Err(inv["reason"].as_str().unwrap_or("Invoice error").to_string());
     }
     inv["pr"].as_str().map(|s| s.to_string()).ok_or("No invoice in response".to_string())
+}
+
+// Real Kyber1024 KEM encryption of proof taproot key
+// Returns: hex(kyber_ciphertext) + ":" + hex(nonce) + ":" + hex(encrypted_data) + ":" + hex(auth_tag)
+fn kyber_encrypt_for_recipient(plaintext: &[u8], recipient_kyber_pk_hex: &str) -> Result<String, String> {
+    use pqcrypto_kyber::kyber1024;
+    use pqcrypto_traits::kem::{PublicKey as KemPk, Ciphertext as KemCt, SharedSecret as KemSs};
+    use sha2::{Sha256, Digest};
+    use rand::RngCore;
+    let pk_bytes = hex::decode(recipient_kyber_pk_hex).map_err(|e| e.to_string())?;
+    let pk = kyber1024::PublicKey::from_bytes(&pk_bytes).map_err(|e| format!("Invalid Kyber pk: {:?}", e))?;
+    // KEM encapsulate — produces shared secret + ciphertext
+    let (shared_secret, kem_ciphertext) = kyber1024::encapsulate(&pk);
+    // Derive AES key from shared secret via SHA256
+    let mut hasher = Sha256::new();
+    hasher.update(shared_secret.as_bytes());
+    hasher.update(b"UBTC_KYBER_AES_KEY_V1");
+    let aes_key = hasher.finalize();
+    // XOR-stream encrypt with SHA3 keystream (AES-GCM would need extra crate)
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let mut stream = Vec::new();
+    let mut counter = 0u64;
+    while stream.len() < plaintext.len() {
+        let mut h = sha2::Sha256::new();
+        h.update(&aes_key);
+        h.update(&nonce);
+        h.update(&counter.to_le_bytes());
+        stream.extend_from_slice(&h.finalize());
+        counter += 1;
+    }
+    let ciphertext: Vec<u8> = plaintext.iter().zip(stream.iter()).map(|(a, b)| a ^ b).collect();
+    // Auth tag = SHA256(kem_ciphertext || nonce || ciphertext || aes_key)
+    let mut auth_hasher = sha2::Sha256::new();
+    auth_hasher.update(kem_ciphertext.as_bytes());
+    auth_hasher.update(&nonce);
+    auth_hasher.update(&ciphertext);
+    auth_hasher.update(&aes_key);
+    let auth_tag = auth_hasher.finalize();
+    Ok(format!("{}:{}:{}:{}",
+        hex::encode(kem_ciphertext.as_bytes()),
+        hex::encode(&nonce),
+        hex::encode(&ciphertext),
+        hex::encode(&auth_tag)
+    ))
+}
+
+// Decrypt Kyber1024 encrypted proof key with recipient's secret key
+fn kyber_decrypt_proof_key(encrypted: &str, recipient_kyber_sk_hex: &str) -> Result<Vec<u8>, String> {
+    use pqcrypto_kyber::kyber1024;
+    use pqcrypto_traits::kem::{SecretKey as KemSk, Ciphertext as KemCt, SharedSecret as KemSs};
+    use sha2::{Sha256, Digest};
+    let parts: Vec<&str> = encrypted.split(':').collect();
+    if parts.len() != 4 { return Err("Invalid encrypted format".to_string()); }
+    let kem_ct_bytes = hex::decode(parts[0]).map_err(|e| e.to_string())?;
+    let nonce = hex::decode(parts[1]).map_err(|e| e.to_string())?;
+    let ciphertext = hex::decode(parts[2]).map_err(|e| e.to_string())?;
+    let auth_tag = hex::decode(parts[3]).map_err(|e| e.to_string())?;
+    let sk_bytes = hex::decode(recipient_kyber_sk_hex).map_err(|e| e.to_string())?;
+    let sk = kyber1024::SecretKey::from_bytes(&sk_bytes).map_err(|e| format!("Invalid Kyber sk: {:?}", e))?;
+    let kem_ct = kyber1024::Ciphertext::from_bytes(&kem_ct_bytes).map_err(|e| format!("Invalid Kyber ct: {:?}", e))?;
+    let shared_secret = kyber1024::decapsulate(&kem_ct, &sk);
+    let mut hasher = Sha256::new();
+    hasher.update(shared_secret.as_bytes());
+    hasher.update(b"UBTC_KYBER_AES_KEY_V1");
+    let aes_key = hasher.finalize();
+    // Verify auth tag
+    let mut auth_hasher = sha2::Sha256::new();
+    auth_hasher.update(&kem_ct_bytes);
+    auth_hasher.update(&nonce);
+    auth_hasher.update(&ciphertext);
+    auth_hasher.update(&aes_key);
+    let expected_tag = auth_hasher.finalize();
+    if expected_tag.as_slice() != auth_tag.as_slice() {
+        return Err("Auth tag mismatch — wrong key or corrupted proof".to_string());
+    }
+    let mut stream = Vec::new();
+    let mut counter = 0u64;
+    while stream.len() < ciphertext.len() {
+        let mut h = sha2::Sha256::new();
+        h.update(&aes_key);
+        h.update(&nonce);
+        h.update(&counter.to_le_bytes());
+        stream.extend_from_slice(&h.finalize());
+        counter += 1;
+    }
+    let plaintext: Vec<u8> = ciphertext.iter().zip(stream.iter()).map(|(a, b)| a ^ b).collect();
+    Ok(plaintext)
 }
 
 async fn lnd_pay_invoice(payment_request: &str) -> Result<serde_json::Value, String> {
@@ -1770,7 +1850,19 @@ async fn send_from_wallet(
                     let recipient_wallet_address: String = sqlx::query("SELECT wallet_address FROM ubtc_users WHERE id = $1")
                         .bind(&recipient_user_id).fetch_one(&pool).await.ok()
                         .and_then(|r| r.try_get("wallet_address").ok()).unwrap_or_default();
-
+let recipient_kyber_pk: String = sqlx::query("SELECT public_key FROM ubtc_wallets WHERE wallet_address = $1")
+                .bind(&req.to_username_or_address).fetch_optional(&pool).await.ok().flatten()
+                        .and_then(|r| r.try_get::<String, _>("public_key").ok())
+                        .unwrap_or_default();
+                    let raw_taproot_key = taproot_secret_key.clone().unwrap_or_default();
+                    let (taproot_key_encrypted, encryption_method) = if !recipient_kyber_pk.is_empty() && !raw_taproot_key.is_empty() {
+                        match kyber_encrypt_for_recipient(raw_taproot_key.as_bytes(), &recipient_kyber_pk) {
+                            Ok(enc) => (enc, "kyber1024"),
+                            Err(_) => (raw_taproot_key.clone(), "none"),
+                        }
+                    } else {
+                        (raw_taproot_key.clone(), "none")
+                    };
                     let proof_data = serde_json::json!({
                         "version": "UBTCV1",
                         "proof_id": proof_id,
