@@ -277,7 +277,8 @@ async fn main() -> anyhow::Result<()> {
        .route("/wallet/redeem", post(wallet_redeem))
         .route("/wallet/sign-payload", post(sign_payload))
        .route("/wallets/all", get(get_all_wallets))
-     .route("/proofs/redeem", post(redeem_proof))
+   .route("/proofs/redeem", post(redeem_proof))
+.route("/proofs/redeem/lightning", post(redeem_proof_lightning))
         .route("/proofs/:wallet_address", get(get_wallet_proofs))
         .route("/proofs/:proof_id/download", post(download_proof))
         .route("/wallet/:address/send", post(send_from_wallet))
@@ -1057,6 +1058,53 @@ async fn transfer_ubtc(
     }
 Ok(Json(TransferResponse { transfer_id, from_vault_id: vault_id, to_address: req.to_address, ubtc_amount: amount.to_string(), taproot_placeholder: true, message: "UBTC transferred with Bitcoin anchor UTXO. Proof file generated for recipient.".to_string() }))
 
+}
+
+async fn lnd_create_invoice(amount_sats: i64, memo: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build().map_err(|e| e.to_string())?;
+    let macaroon = std::fs::read("C:\\lnd\\data\\data\\chain\\bitcoin\\testnet4\\admin.macaroon")
+        .map_err(|e| format!("macaroon read error: {}", e))?;
+    let macaroon_hex = hex::encode(&macaroon);
+    let body = serde_json::json!({ "value": amount_sats, "memo": memo, "expiry": 3600 });
+    let res = client.post("https://127.0.0.1:8092/v1/invoices")
+        .header("Grpc-Metadata-macaroon", &macaroon_hex)
+        .json(&body).send().await.map_err(|e| e.to_string())?;
+    let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    data["payment_request"].as_str().map(|s| s.to_string())
+        .ok_or_else(|| format!("no payment_request in response: {:?}", data))
+}
+
+async fn redeem_proof_lightning(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row;
+    let proof_id = req["proof_id"].as_str().unwrap_or("");
+    let ubtc_amount = req["ubtc_amount"].as_str().unwrap_or("0");
+    let amount_f: f64 = ubtc_amount.parse().unwrap_or(0.0);
+    // Convert UBTC to sats (1 UBTC = 1 USD worth of BTC)
+    let btc_price = fetch_btc_price().await.unwrap_or(dec!(65000));
+    let btc_price_f: f64 = btc_price.to_string().parse().unwrap_or(65000.0);
+    let amount_sats = ((amount_f / btc_price_f) * 100_000_000.0) as i64;
+    if amount_sats < 1 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "amount too small"}))));
+    }
+    let memo = format!("UBTC redemption {} — proof {}", ubtc_amount, proof_id);
+    match lnd_create_invoice(amount_sats, &memo).await {
+        Ok(payment_request) => {
+            Ok(Json(serde_json::json!({
+                "payment_request": payment_request,
+                "amount_sats": amount_sats,
+                "ubtc_amount": ubtc_amount,
+                "proof_id": proof_id,
+                "expires_in": 3600,
+                "method": "lightning"
+            })))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("LND error: {}", e)}))))
+    }
 }
 
 async fn redeem_proof(
