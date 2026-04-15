@@ -277,7 +277,8 @@ async fn main() -> anyhow::Result<()> {
        .route("/wallet/redeem", post(wallet_redeem))
         .route("/wallet/sign-payload", post(sign_payload))
        .route("/wallets/all", get(get_all_wallets))
-   .route("/proofs/redeem", post(redeem_proof))
+  .route("/proofs/redeem", post(redeem_proof))
+        .route("/proofs/decrypt", post(decrypt_proof_key))
 .route("/proofs/redeem/lightning", post(redeem_proof_lightning))
         .route("/proofs/:wallet_address", get(get_wallet_proofs))
         .route("/proofs/:proof_id/download", post(download_proof))
@@ -1184,6 +1185,23 @@ fn kyber_decrypt_proof_key(encrypted: &str, recipient_kyber_sk_hex: &str) -> Res
     }
     let plaintext: Vec<u8> = ciphertext.iter().zip(stream.iter()).map(|(a, b)| a ^ b).collect();
     Ok(plaintext)
+}
+
+async fn decrypt_proof_key(
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let encrypted = req["encrypted"].as_str().unwrap_or("");
+    let kyber_sk = req["kyber_sk"].as_str().unwrap_or("");
+    if encrypted.is_empty() || kyber_sk.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "encrypted and kyber_sk required"}))));
+    }
+    match kyber_decrypt_proof_key(encrypted, kyber_sk) {
+        Ok(plaintext) => {
+            let taproot_key = String::from_utf8(plaintext).unwrap_or_default();
+            Ok(Json(serde_json::json!({ "taproot_key": taproot_key })))
+        },
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))))
+    }
 }
 
 async fn lnd_pay_invoice(payment_request: &str) -> Result<serde_json::Value, String> {
