@@ -121,7 +121,7 @@ fn hash_recovery_key(key: &str) -> String {
 #[derive(Serialize)] struct UserLookupResponse { user_id: String, username: String, wallet_address: String, found: bool }
 #[derive(Deserialize)] struct SendFromWalletRequest { from_address: String, to_username_or_address: String, amount: String, send_type: String }
 #[derive(Serialize)] struct SendFromWalletResponse { transaction_id: String, from_address: String, to: String, amount: String, send_type: String, message: String }
-#[derive(Deserialize)] struct VaultToWalletRequest { vault_id: String, wallet_address: String, ubtc_amount: String }
+#[derive(Deserialize)] struct VaultToWalletRequest { vault_id: String, wallet_address: String, ubtc_amount: String, second_key: Option<String> }
 #[derive(Serialize)] struct VaultToWalletResponse { transaction_id: String, vault_id: String, wallet_address: String, ubtc_amount: String, new_vault_balance: String, new_wallet_balance: String, message: String }
 #[derive(Serialize)] struct VaultWallet { wallet_id: String, wallet_address: String, username: String, balance: String, wallet_name: String }
 #[derive(Serialize)] struct VaultWalletsResponse { vault_id: String, wallets: Vec<VaultWallet> }
@@ -603,6 +603,31 @@ async fn vault_to_wallet(
     if status != "active" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"vault not active"})))); }
     let outstanding = Decimal::from_str(&ubtc_minted).unwrap_or(dec!(0));
     let amount = Decimal::from_str(&req.ubtc_amount).map_err(|_| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid amount"}))))?;
+    if status != "active" { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"vault not active"})))); }
+    // Verify Protocol Second Key before allowing any vault-to-wallet move
+    let second_key = req.second_key.as_deref().unwrap_or("");
+    if second_key.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"Protocol Second Key required"}))));
+    }
+    let psk_row = sqlx::query("SELECT protocol_key_hash FROM vaults WHERE id = $1")
+        .bind(&req.vault_id).fetch_optional(&pool).await.ok().flatten();
+    let stored_hash = psk_row.and_then(|r| r.try_get::<String, _>("protocol_key_hash").ok()).unwrap_or_default();
+    let key_valid = if !stored_hash.is_empty() {
+        use sha2::{Sha256, Digest};
+        if let Ok(psk_bytes) = hex::decode(second_key) {
+            let mut hasher = Sha256::new();
+            hasher.update(&psk_bytes);
+            hasher.update(b"ubtc-psk-salt-2026");
+            hex::encode(hasher.finalize()) == stored_hash
+        } else { false }
+    } else {
+        second_key == std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default()
+    };
+    if !key_valid {
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"Invalid Protocol Second Key"}))));
+    }
+    let outstanding = Decimal::from_str(&ubtc_minted).unwrap_or(dec!(0));
+    let amount = Decimal::from_str(&req.ubtc_amount).map_err(|_| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid ubtc_amount"}))))?;
     if amount > outstanding { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("amount {} exceeds vault balance {}", amount, outstanding)})))); }
     let wallet_row = sqlx::query("SELECT w.id, w.balance, w.user_id, u.username FROM ubtc_wallets w JOIN ubtc_users u ON w.user_id = u.id WHERE w.wallet_address = $1")
         .bind(&req.wallet_address).fetch_one(&pool).await
