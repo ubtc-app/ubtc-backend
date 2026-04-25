@@ -12,6 +12,10 @@ use std::str::FromStr;
 use totp_rs::{Algorithm, TOTP, Secret};
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{PublicKey, SecretKey, SignedMessage};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
 
 struct QuantumKeypair { public_key: String, secret_key: String }
 
@@ -249,7 +253,12 @@ async fn main() -> anyhow::Result<()> {
         .max_connections(5).connect_with(connect_options).await?;
     tracing::info!("Connected to database");
     tracing::info!("Network: {:?}", get_network());
-    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+  let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+
+    // Simple in-memory rate limiter: IP → (count, window_start)
+    let rate_limit_map: Arc<StdMutex<HashMap<String, (u32, Instant)>>> = Arc::new(StdMutex::new(HashMap::new()));
+
+ let _rate_limiter = rate_limit_map.clone(); // available for future middleware
     let app = Router::new()
         .route("/health", get(health))
         .route("/vaults", post(create_vault))
@@ -322,9 +331,45 @@ async fn get_price() -> Json<serde_json::Value> {
 
 async fn fetch_btc_price() -> Option<Decimal> {
     let client = reqwest::Client::new();
-    let res = client.get("https://api.coinbase.com/v2/prices/BTC-USD/spot").send().await.ok()?;
-    let json: serde_json::Value = res.json().await.ok()?;
-    Decimal::from_str(json["data"]["amount"].as_str()?).ok()
+    let mut prices: Vec<Decimal> = Vec::new();
+
+    // Feed 1: Coinbase
+    if let Ok(res) = client.get("https://api.coinbase.com/v2/prices/BTC-USD/spot").send().await {
+        if let Ok(json) = res.json::<serde_json::Value>().await {
+            if let Some(p) = json["data"]["amount"].as_str().and_then(|s| Decimal::from_str(s).ok()) {
+                prices.push(p);
+            }
+        }
+    }
+
+    // Feed 2: Binance
+    if let Ok(res) = client.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").send().await {
+        if let Ok(json) = res.json::<serde_json::Value>().await {
+            if let Some(p) = json["price"].as_str().and_then(|s| Decimal::from_str(s).ok()) {
+                prices.push(p);
+            }
+        }
+    }
+
+    // Feed 3: Kraken
+    if let Ok(res) = client.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD").send().await {
+        if let Ok(json) = res.json::<serde_json::Value>().await {
+            if let Some(p) = json["result"]["XXBTZUSD"]["c"][0].as_str().and_then(|s| Decimal::from_str(s).ok()) {
+                prices.push(p);
+            }
+        }
+    }
+
+    if prices.is_empty() { return None; }
+
+    // Return median price — resistant to single feed manipulation
+    prices.sort();
+    let mid = prices.len() / 2;
+    if prices.len() % 2 == 0 {
+        Some((prices[mid - 1] + prices[mid]) / Decimal::from(2))
+    } else {
+        Some(prices[mid])
+    }
 }
 
 async fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -373,6 +418,25 @@ async fn spend_vault_utxo(pool: &sqlx::PgPool, vault_id: &str, destination_addre
         .bind(&final_txid).bind(&utxo_id).execute(pool).await.ok();
     tracing::info!("Spent vault UTXO {} — txid: {}", utxo_id, final_txid);
     Ok(final_txid)
+}
+
+fn check_rate_limit(
+    map: &Arc<StdMutex<HashMap<String, (u32, Instant)>>>,
+    key: &str,
+    max_per_minute: u32,
+) -> bool {
+    let mut m = map.lock().unwrap();
+    let now = Instant::now();
+    let entry = m.entry(key.to_string()).or_insert((0, now));
+    if now.duration_since(entry.1) > Duration::from_secs(60) {
+        *entry = (1, now);
+        true
+    } else if entry.0 < max_per_minute {
+        entry.0 += 1;
+        true
+    } else {
+        false
+    }
 }
 
 async fn create_vault(
@@ -1603,10 +1667,30 @@ async fn redeem_proof(
     } else {
         req["taproot_key"].as_str().unwrap_or("").to_string()
     };
-    let tsk = taproot_secret_key
-        .filter(|k| !k.is_empty())
-        .or_else(|| if !proof_taproot_key.is_empty() { Some(proof_taproot_key) } else { None })
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "vault has no taproot key — cannot redeem"}))))?;
+   // Handle both legacy plaintext and new kyber-encrypted taproot keys
+    // For kyber: prefixed keys, the client must supply the decrypted taproot key via proof
+    let tsk = if let Some(ref stored_key) = taproot_secret_key {
+        if stored_key.starts_with("kyber:") {
+            // New format — taproot key encrypted with user's Kyber PK
+            // Client decrypts via proof file and sends decrypted key
+            if !proof_taproot_key.is_empty() {
+                proof_taproot_key.clone()
+            } else {
+                return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "This vault uses client-side key encryption — please decrypt your proof file first"}))));
+            }
+        } else if !stored_key.is_empty() {
+            // Legacy format — plaintext key in DB (old vaults)
+            stored_key.clone()
+        } else if !proof_taproot_key.is_empty() {
+            proof_taproot_key.clone()
+        } else {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "vault has no taproot key — cannot redeem"}))));
+        }
+    } else if !proof_taproot_key.is_empty() {
+        proof_taproot_key.clone()
+    } else {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "vault has no taproot key — cannot redeem"}))));
+    };
     // Normalise key length — must be exactly 64 hex chars (32 bytes)
     let tsk = if tsk.len() == 65 { tsk[1..].to_string() } else { tsk };
 
