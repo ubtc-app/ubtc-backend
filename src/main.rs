@@ -312,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
 		.route("/vaults/:id/circulation", get(get_vault_circulation))
         .route("/vaults/:id/redemptions", get(get_vault_redemptions))
         .route("/vaults/:id/notifications", get(get_vault_notifications))
+		.route("/wallet/username", post(set_wallet_username))
 .route("/vaults/:id/notifications/:notif_id/dismiss", post(dismiss_notification))
         .with_state(pool)
         .layer(cors);
@@ -3446,4 +3447,36 @@ async fn get_vault_redemptions(
         })
     }).collect();
     Ok(Json(serde_json::json!({ "redemptions": redemptions })))
+}
+async fn set_wallet_username(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row;
+    let wallet_address = req["wallet_address"].as_str().unwrap_or("");
+    let quantum_username = req["quantum_username"].as_str().unwrap_or("");
+    if wallet_address.is_empty() || quantum_username.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "wallet_address and quantum_username required"}))));
+    }
+    if quantum_username.len() < 3 || quantum_username.len() > 20 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "username must be 3-20 characters"}))));
+    }
+    // Check uniqueness
+    let existing = sqlx::query("SELECT id FROM ubtc_users WHERE username = $1")
+        .bind(quantum_username).fetch_optional(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    if existing.is_some() {
+        return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": "username already taken"}))));
+    }
+   // Update username for the user linked to this wallet or vault
+    let vault_id = req["vault_id"].as_str().unwrap_or("");
+    let updated = if !vault_id.is_empty() {
+        sqlx::query("UPDATE ubtc_users SET username = $1 WHERE id = (SELECT user_id FROM ubtc_wallets WHERE linked_vault_id = $2)")
+            .bind(quantum_username).bind(vault_id).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
+    } else {
+        sqlx::query("UPDATE ubtc_users SET username = $1 WHERE wallet_address = $2")
+            .bind(quantum_username).bind(wallet_address).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
+    };
+    tracing::info!("Quantum username @{} set — rows affected: {}", quantum_username, updated.rows_affected());
+    tracing::info!("Quantum username @{} set for {}", quantum_username, wallet_address);
+    Ok(Json(serde_json::json!({"success": true, "username": quantum_username})))
 }
