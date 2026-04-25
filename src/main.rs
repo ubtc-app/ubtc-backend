@@ -123,8 +123,8 @@ fn hash_recovery_key(key: &str) -> String {
 #[derive(Serialize)] struct CreateWalletResponse { user_id: String, username: String, wallet_address: String, public_key: String, private_key: String, sphincs_pk: String, sphincs_sk: String, kyber_pk: String, kyber_sk: String, message: String }
 #[derive(Serialize)] struct WalletResponse { wallet_address: String, username: String, balance: String, public_key: String }
 #[derive(Serialize)] struct UserLookupResponse { user_id: String, username: String, wallet_address: String, found: bool }
-#[derive(Deserialize)] struct SendFromWalletRequest { from_address: String, to_username_or_address: String, amount: String, send_type: String }
-#[derive(Serialize)] struct SendFromWalletResponse { transaction_id: String, from_address: String, to: String, amount: String, send_type: String, message: String }
+#[derive(Deserialize)] struct SendFromWalletRequest { from_address: String, to_username_or_address: String, amount: String, send_type: String, second_key: Option<String> }
+#[derive(Serialize)] struct SendFromWalletResponse { transaction_id: String, from_address: String, to: String, amount: String, send_type: String, message: String, bitcoin_txid: Option<String> }
 #[derive(Deserialize)] struct VaultToWalletRequest { vault_id: String, wallet_address: String, ubtc_amount: String, second_key: Option<String> }
 #[derive(Serialize)] struct VaultToWalletResponse { transaction_id: String, vault_id: String, wallet_address: String, ubtc_amount: String, new_vault_balance: String, new_wallet_balance: String, message: String }
 #[derive(Serialize)] struct VaultWallet { wallet_id: String, wallet_address: String, username: String, balance: String, wallet_name: String }
@@ -313,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/vaults/:id/redemptions", get(get_vault_redemptions))
         .route("/vaults/:id/notifications", get(get_vault_notifications))
 		.route("/wallet/username", post(set_wallet_username))
+        .route("/wallet/verify-psk", post(verify_wallet_psk))
 .route("/vaults/:id/notifications/:notif_id/dismiss", post(dismiss_notification))
         .with_state(pool)
         .layer(cors);
@@ -2248,6 +2249,34 @@ async fn send_from_wallet(
     let sender_balance_dec = Decimal::from_str(&sender_balance).unwrap_or(dec!(0));
     let amount = Decimal::from_str(&req.amount).map_err(|_| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid amount"}))))?;
     if amount > sender_balance_dec { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("insufficient balance: {} available", sender_balance_dec)})))); }
+
+  // Verify Protocol Second Key if provided
+    tracing::info!("PSK check — linked_vault_id: '{}', second_key present: {}", linked_vault_id, req.second_key.is_some());
+    if let Some(ref provided_key) = req.second_key {
+        if !provided_key.is_empty() {
+            tracing::info!("PSK check — provided key first 16 chars: {}", &provided_key[..16.min(provided_key.len())]);
+            let vault_key_row = sqlx::query("SELECT protocol_key_hash FROM vaults WHERE id = $1")
+                .bind(&linked_vault_id).fetch_optional(&pool).await.unwrap_or(None);
+            tracing::info!("PSK check — vault row found: {}", vault_key_row.is_some());
+            if let Some(row) = vault_key_row {
+                let stored_hash: String = row.try_get("protocol_key_hash").unwrap_or_default();
+                if !stored_hash.is_empty() {
+                    use sha2::{Sha256, Digest};
+                    let key_bytes = hex::decode(provided_key).unwrap_or_default();
+                    let mut hasher = Sha256::new();
+                    hasher.update(&key_bytes);
+                    hasher.update(b"ubtc-psk-salt-2026");
+                    let computed_hash = hex::encode(hasher.finalize());
+                    if computed_hash != stored_hash {
+                        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid Protocol Second Key"}))));
+                    }
+					tracing::info!("PSK check — computed: {} stored: {}", computed_hash, stored_hash);
+                    tracing::info!("PSK verified for wallet transfer from {}", req.from_address);
+                }
+            }
+        }
+    }
+
     let tx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
     let new_sender_balance = sender_balance_dec - amount;
     if req.send_type == "internal" {
@@ -2398,6 +2427,7 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
             }
         }
 // Post QUANTUM:TRANSFER to Bitcoin via OP_RETURN
+                 let mut quantum_txid: Option<String> = None;
                  let transfer_payload = format!("QUANTUM:TRANSFER:{}:{}:{}", tx_id, req.from_address, req.to_username_or_address);
                  let payload_hex = hex::encode(transfer_payload.as_bytes());
                  let (rpc_url, rpc_user, rpc_pass) = get_rpc();
@@ -2423,6 +2453,7 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                                                          if let Ok(br_data) = br.json::<serde_json::Value>().await {
                                                              if let Some(btc_txid) = br_data["result"].as_str() {
                                                                  tracing::info!("QUANTUM:TRANSFER posted to Bitcoin — txid: {}", btc_txid);
+                                                                 quantum_txid = Some(btc_txid.to_string());
                                                              }
                                                          }
                                                      }
@@ -2435,7 +2466,7 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                          }
                      }
                  }
- return Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. Proof file generated for recipient.".to_string() }));
+return Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. Proof file generated for recipient.".to_string(), bitcoin_txid: quantum_txid }));
     } else {
         if linked_vault_id.is_empty() { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No linked vault. External sends require a vault-linked wallet."})))); }
         let vault_row = sqlx::query("SELECT ubtc_minted, btc_amount_sats, status FROM vaults WHERE id = $1").bind(&linked_vault_id).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"linked vault not found"}))))?;
@@ -2459,7 +2490,7 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
         sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'external_send', NOW())").bind(&burn_id).bind(&linked_vault_id).bind(amount.to_string()).execute(&pool).await.ok();
         sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'external', 'External send', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(amount.to_string()).execute(&pool).await.ok();
         tracing::info!("External wallet send — {} UBTC + {} BTC to {}", amount, btc_sent, req.to_username_or_address);
-        Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: req.to_username_or_address, amount: amount.to_string(), send_type: "external".to_string(), message: format!("${} UBTC sent. {} BTC released from vault.", amount, btc_sent) }))
+       Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: req.to_username_or_address, amount: amount.to_string(), send_type: "external".to_string(), message: format!("${} UBTC sent. {} BTC released from vault.", amount, btc_sent), bitcoin_txid: None }))
     }
 }
 
@@ -3479,4 +3510,33 @@ async fn set_wallet_username(
     tracing::info!("Quantum username @{} set — rows affected: {}", quantum_username, updated.rows_affected());
     tracing::info!("Quantum username @{} set for {}", quantum_username, wallet_address);
     Ok(Json(serde_json::json!({"success": true, "username": quantum_username})))
+}
+async fn verify_wallet_psk(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row;
+    let wallet_address = req["wallet_address"].as_str().unwrap_or("");
+    let second_key = req["second_key"].as_str().unwrap_or("");
+    if wallet_address.is_empty() || second_key.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing fields"}))));
+    }
+    let vault_row = sqlx::query(
+        "SELECT v.protocol_key_hash FROM vaults v JOIN ubtc_wallets w ON w.linked_vault_id = v.id WHERE w.wallet_address = $1"
+    ).bind(wallet_address).fetch_optional(&pool).await.unwrap_or(None);
+    let stored_hash = vault_row.and_then(|r| r.try_get::<String, _>("protocol_key_hash").ok()).unwrap_or_default();
+    if stored_hash.is_empty() {
+        return Ok(Json(serde_json::json!({"valid": true, "message": "no PSK configured"})));
+    }
+    use sha2::{Sha256, Digest};
+    let key_bytes = hex::decode(second_key).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&key_bytes);
+    hasher.update(b"ubtc-psk-salt-2026");
+    let computed = hex::encode(hasher.finalize());
+    if computed == stored_hash {
+        Ok(Json(serde_json::json!({"valid": true})))
+    } else {
+        Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid Protocol Second Key"}))))
+    }
 }
