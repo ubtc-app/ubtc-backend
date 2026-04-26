@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "ubtc-api"
 version = "0.1.0"
 edition = "2021"
@@ -21,8 +21,8 @@ rust_decimal_macros = "1"
 totp-rs = { version = "5", features = ["gen_secret"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
-pqcrypto-dilithium = "0.5"
-pqcrypto-sphincsplus = "0.6"
+fips204 = "0.4"
+pqcrypto-sphincsplus = "0.7"
 pqcrypto-traits = "0.3"
 base64 = "0.21"
 hex = "0.4"
