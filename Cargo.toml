@@ -31,4 +31,4 @@ ubtc-protocol = { path = "../../ubtc-protocol" }
 bitcoin = { version = "0.31", features = ["rand-std"] }
 secp256k1 = { version = "0.28", features = ["rand-std", "global-context"] }
 bitcoin_hashes = "0.13"
-pqcrypto-kyber = "0.8"
+pqcrypto-mlkem = "0.1"
