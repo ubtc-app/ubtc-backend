@@ -2432,39 +2432,89 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                  let payload_hex = hex::encode(transfer_payload.as_bytes());
                  let (rpc_url, rpc_user, rpc_pass) = get_rpc();
                  let client = reqwest::Client::new();
-                 if let Ok(res) = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+
+                 // Step 1: createrawtransaction
+                 let raw_tx: Option<String> = match client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
                      .json(&serde_json::json!({"jsonrpc":"1.0","method":"createrawtransaction","params":[[],{"data": payload_hex}]}))
                      .send().await {
-                     if let Ok(data) = res.json::<serde_json::Value>().await {
-                         if let Some(raw_tx) = data["result"].as_str() {
-                             if let Ok(fd) = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
-                                 .json(&serde_json::json!({"jsonrpc":"1.0","method":"fundrawtransaction","params":[raw_tx]}))
-                                 .send().await {
-                                 if let Ok(fd_data) = fd.json::<serde_json::Value>().await {
-                                     if let Some(funded_hex) = fd_data["result"]["hex"].as_str() {
-                                         if let Ok(sd) = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
-                                             .json(&serde_json::json!({"jsonrpc":"1.0","method":"signrawtransactionwithwallet","params":[funded_hex]}))
-                                             .send().await {
-                                             if let Ok(sd_data) = sd.json::<serde_json::Value>().await {
-                                                 if let Some(signed_hex) = sd_data["result"]["hex"].as_str() {
-                                                     if let Ok(br) = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
-                                                         .json(&serde_json::json!({"jsonrpc":"1.0","method":"sendrawtransaction","params":[signed_hex]}))
-                                                         .send().await {
-                                                         if let Ok(br_data) = br.json::<serde_json::Value>().await {
-                                                             if let Some(btc_txid) = br_data["result"].as_str() {
-                                                                 tracing::info!("QUANTUM:TRANSFER posted to Bitcoin â€” txid: {}", btc_txid);
-                                                                 quantum_txid = Some(btc_txid.to_string());
-                                                             }
-                                                         }
-                                                     }
-                                                 }
-                                             }
-                                         }
-                                     }
-                                 }
+                     Ok(res) => match res.json::<serde_json::Value>().await {
+                         Ok(data) => {
+                             if let Some(err) = data.get("error").filter(|e| !e.is_null()) {
+                                 tracing::error!("QUANTUM:TRANSFER createrawtransaction RPC error: {}", err);
+                                 None
+                             } else {
+                                 data["result"].as_str().map(|s| s.to_string())
                              }
                          }
+                         Err(e) => { tracing::error!("QUANTUM:TRANSFER createrawtransaction parse failed: {}", e); None }
+                     },
+                     Err(e) => { tracing::error!("QUANTUM:TRANSFER createrawtransaction request failed: {}", e); None }
+                 };
+
+                 // Step 2: fundrawtransaction
+                 let funded_hex: Option<String> = if let Some(raw) = raw_tx {
+                     match client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+                         .json(&serde_json::json!({"jsonrpc":"1.0","method":"fundrawtransaction","params":[raw]}))
+                         .send().await {
+                         Ok(fd) => match fd.json::<serde_json::Value>().await {
+                             Ok(fd_data) => {
+                                 if let Some(err) = fd_data.get("error").filter(|e| !e.is_null()) {
+                                     tracing::error!("QUANTUM:TRANSFER fundrawtransaction RPC error: {} (wallet may be empty or no UTXOs)", err);
+                                     None
+                                 } else {
+                                     fd_data["result"]["hex"].as_str().map(|s| s.to_string())
+                                 }
+                             }
+                             Err(e) => { tracing::error!("QUANTUM:TRANSFER fundrawtransaction parse failed: {}", e); None }
+                         },
+                         Err(e) => { tracing::error!("QUANTUM:TRANSFER fundrawtransaction request failed: {}", e); None }
                      }
+                 } else { None };
+
+                 // Step 3: signrawtransactionwithwallet
+                 let signed_hex: Option<String> = if let Some(funded) = funded_hex {
+                     match client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+                         .json(&serde_json::json!({"jsonrpc":"1.0","method":"signrawtransactionwithwallet","params":[funded]}))
+                         .send().await {
+                         Ok(sd) => match sd.json::<serde_json::Value>().await {
+                             Ok(sd_data) => {
+                                 if let Some(err) = sd_data.get("error").filter(|e| !e.is_null()) {
+                                     tracing::error!("QUANTUM:TRANSFER signrawtransaction RPC error: {}", err);
+                                     None
+                                 } else {
+                                     sd_data["result"]["hex"].as_str().map(|s| s.to_string())
+                                 }
+                             }
+                             Err(e) => { tracing::error!("QUANTUM:TRANSFER signrawtransaction parse failed: {}", e); None }
+                         },
+                         Err(e) => { tracing::error!("QUANTUM:TRANSFER signrawtransaction request failed: {}", e); None }
+                     }
+                 } else { None };
+
+                 // Step 4: sendrawtransaction
+                 if let Some(signed) = signed_hex {
+                     match client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+                         .json(&serde_json::json!({"jsonrpc":"1.0","method":"sendrawtransaction","params":[signed]}))
+                         .send().await {
+                         Ok(br) => match br.json::<serde_json::Value>().await {
+                             Ok(br_data) => {
+                                 if let Some(err) = br_data.get("error").filter(|e| !e.is_null()) {
+                                     tracing::error!("QUANTUM:TRANSFER sendrawtransaction RPC error: {}", err);
+                                 } else if let Some(btc_txid) = br_data["result"].as_str() {
+                                     tracing::info!("✅ QUANTUM:TRANSFER posted to Bitcoin testnet4 — txid: {}", btc_txid);
+                                     quantum_txid = Some(btc_txid.to_string());
+                                 } else {
+                                     tracing::error!("QUANTUM:TRANSFER sendrawtransaction returned no txid: {:?}", br_data);
+                                 }
+                             }
+                             Err(e) => tracing::error!("QUANTUM:TRANSFER sendrawtransaction parse failed: {}", e),
+                         },
+                         Err(e) => tracing::error!("QUANTUM:TRANSFER sendrawtransaction request failed: {}", e),
+                     }
+                 }
+
+                 if quantum_txid.is_none() {
+                     tracing::error!("❌ QUANTUM:TRANSFER did NOT reach Bitcoin testnet4 — see error(s) above. Transfer recorded off-chain only.");
                  }
 return Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. Proof file generated for recipient.".to_string(), bitcoin_txid: quantum_txid }));
     } else {
