@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     routing::{get, post},
     Router, Json,
     http::StatusCode,
@@ -495,7 +495,7 @@ async fn create_vault(
     let sphincs_sk = hex::encode(&sphincs_sk_bytes);
  // Generate REAL Kyber1024 keypair (NIST post-quantum KEM standard)
     // Use client-provided key if supplied â€” client-side key generation preferred
-    use pqcrypto_kyber::kyber1024;
+    use pqcrypto_mlkem::mlkem1024;
     use pqcrypto_traits::kem::{PublicKey as KemPk, SecretKey as KemSk};
     let (kyber_pk, kyber_sk) = if let Some(ref client_pk) = req.client_kyber_pk {
         // Client generated the keypair â€” server only stores public key
@@ -504,7 +504,7 @@ async fn create_vault(
         (client_pk.clone(), String::new()) // empty sk â€” never stored server-side
     } else {
         // Fallback: server generates (legacy mode)
-        let (kyber_pk_raw, kyber_sk_raw) = kyber1024::keypair();
+        let (kyber_pk_raw, kyber_sk_raw) = mlkem1024::keypair();
         (hex::encode(kyber_pk_raw.as_bytes()), hex::encode(kyber_sk_raw.as_bytes()))
     };
   // Store public key in vault for transfer verification
@@ -536,11 +536,11 @@ async fn create_vault(
             let taproot_sk_hex = hex::encode(key_bytes);
             let taproot_to_store = if !kyber_pk.is_empty() {
                 // Encrypt with user's Kyber public key
-                use pqcrypto_kyber::kyber1024;
+                use pqcrypto_mlkem::mlkem1024;
                 use pqcrypto_traits::kem::{PublicKey as KemPk, Ciphertext as KemCt, SharedSecret as KemSs};
                 if let Ok(pk_bytes) = hex::decode(&kyber_pk) {
-                    if let Ok(pk) = kyber1024::PublicKey::from_bytes(&pk_bytes) {
-                        let (ciphertext, shared_secret) = kyber1024::encapsulate(&pk);
+                    if let Ok(pk) = mlkem1024::PublicKey::from_bytes(&pk_bytes) {
+                        let (ciphertext, shared_secret) = mlkem1024::encapsulate(&pk);
                         // XOR taproot key with shared secret (simple encryption)
                         let ss_bytes = shared_secret.as_bytes();
                         let sk_bytes = hex::decode(&taproot_sk_hex).unwrap_or_default();
@@ -1409,14 +1409,14 @@ fn kyber_encrypt_for_recipient(plaintext: &[u8], recipient_kyber_pk_hex: &str) -
     if recipient_kyber_pk_hex.len() < 3136 {
         return Err("Not a real Kyber1024 key â€” use new account".to_string());
     }
-    use pqcrypto_kyber::kyber1024;
+    use pqcrypto_mlkem::mlkem1024;
     use pqcrypto_traits::kem::{PublicKey as KemPk, Ciphertext as KemCt, SharedSecret as KemSs};
     use sha2::{Sha256, Digest};
     use rand::RngCore;
     let pk_bytes = hex::decode(recipient_kyber_pk_hex).map_err(|e| e.to_string())?;
-    let pk = kyber1024::PublicKey::from_bytes(&pk_bytes).map_err(|e| format!("Invalid Kyber pk: {:?}", e))?;
+    let pk = mlkem1024::PublicKey::from_bytes(&pk_bytes).map_err(|e| format!("Invalid Kyber pk: {:?}", e))?;
     // KEM encapsulate â€” produces shared secret + ciphertext
-    let (shared_secret, kem_ciphertext) = kyber1024::encapsulate(&pk);
+    let (shared_secret, kem_ciphertext) = mlkem1024::encapsulate(&pk);
     // Derive AES key from shared secret via SHA256
     let mut hasher = Sha256::new();
     hasher.update(shared_secret.as_bytes());
@@ -1453,7 +1453,7 @@ fn kyber_encrypt_for_recipient(plaintext: &[u8], recipient_kyber_pk_hex: &str) -
 
 // Decrypt Kyber1024 encrypted proof key with recipient's secret key
 fn kyber_decrypt_proof_key(encrypted: &str, recipient_kyber_sk_hex: &str) -> Result<Vec<u8>, String> {
-    use pqcrypto_kyber::kyber1024;
+    use pqcrypto_mlkem::mlkem1024;
     use pqcrypto_traits::kem::{SecretKey as KemSk, Ciphertext as KemCt, SharedSecret as KemSs};
     use sha2::{Sha256, Digest};
     let parts: Vec<&str> = encrypted.split(':').collect();
@@ -1463,9 +1463,9 @@ fn kyber_decrypt_proof_key(encrypted: &str, recipient_kyber_sk_hex: &str) -> Res
     let ciphertext = hex::decode(parts[2]).map_err(|e| e.to_string())?;
     let auth_tag = hex::decode(parts[3]).map_err(|e| e.to_string())?;
     let sk_bytes = hex::decode(recipient_kyber_sk_hex).map_err(|e| e.to_string())?;
-    let sk = kyber1024::SecretKey::from_bytes(&sk_bytes).map_err(|e| format!("Invalid Kyber sk: {:?}", e))?;
-    let kem_ct = kyber1024::Ciphertext::from_bytes(&kem_ct_bytes).map_err(|e| format!("Invalid Kyber ct: {:?}", e))?;
-    let shared_secret = kyber1024::decapsulate(&kem_ct, &sk);
+    let sk = mlkem1024::SecretKey::from_bytes(&sk_bytes).map_err(|e| format!("Invalid Kyber sk: {:?}", e))?;
+    let kem_ct = mlkem1024::Ciphertext::from_bytes(&kem_ct_bytes).map_err(|e| format!("Invalid Kyber ct: {:?}", e))?;
+    let shared_secret = mlkem1024::decapsulate(&kem_ct, &sk);
     let mut hasher = Sha256::new();
     hasher.update(shared_secret.as_bytes());
     hasher.update(b"UBTC_KYBER_AES_KEY_V1");
@@ -2183,9 +2183,9 @@ use rand::RngCore as SphincsRng;
     rand::thread_rng().fill_bytes(&mut sphincs_pk_bytes);
     let sphincs_pk_b64 = hex::encode(&sphincs_pk_bytes);
     let sphincs_sk_b64 = hex::encode(&sphincs_sk_bytes);
-   use pqcrypto_kyber::kyber1024;
+   use pqcrypto_mlkem::mlkem1024;
     use pqcrypto_traits::kem::{PublicKey as KemPk, SecretKey as KemSk};
-    let (kyber_pk_raw, kyber_sk_raw) = kyber1024::keypair();
+    let (kyber_pk_raw, kyber_sk_raw) = mlkem1024::keypair();
     let kyber_pk_hex = hex::encode(kyber_pk_raw.as_bytes());
     let kyber_sk_hex = hex::encode(kyber_sk_raw.as_bytes());
     tracing::info!("Created 3-key wallet for {} â€” {}", req.username, wallet_address);
@@ -2501,7 +2501,7 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                                  if let Some(err) = br_data.get("error").filter(|e| !e.is_null()) {
                                      tracing::error!("QUANTUM:TRANSFER sendrawtransaction RPC error: {}", err);
                                  } else if let Some(btc_txid) = br_data["result"].as_str() {
-                                     tracing::info!("✅ QUANTUM:TRANSFER posted to Bitcoin testnet4 — txid: {}", btc_txid);
+                                    tracing::info!("[OK] QUANTUM:TRANSFER posted to Bitcoin testnet4 - txid: {}", btc_txid);
                                      quantum_txid = Some(btc_txid.to_string());
                                  } else {
                                      tracing::error!("QUANTUM:TRANSFER sendrawtransaction returned no txid: {:?}", br_data);
@@ -2514,7 +2514,7 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                  }
 
                  if quantum_txid.is_none() {
-                     tracing::error!("❌ QUANTUM:TRANSFER did NOT reach Bitcoin testnet4 — see error(s) above. Transfer recorded off-chain only.");
+                     tracing::error!("[FAIL] QUANTUM:TRANSFER did NOT reach Bitcoin testnet4 - see error(s) above. Transfer recorded off-chain only.");
                  }
 return Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. Proof file generated for recipient.".to_string(), bitcoin_txid: quantum_txid }));
     } else {
