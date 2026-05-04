@@ -3092,7 +3092,8 @@ async fn redeem_ubtc(
     use sqlx::Row;
     let err = |msg: &str| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
     let vault_id = req["vault_id"].as_str().ok_or_else(|| err("vault_id required"))?;
-    let ubtc_amount: f64 = req["ubtc_amount"].as_f64().ok_or_else(|| err("ubtc_amount required"))?;
+  let ubtc_amount_str = req["ubtc_amount"].as_str().ok_or_else(|| err("ubtc_amount required (must be a numeric string)"))?;
+    let ubtc_amount: f64 = ubtc_amount_str.parse().map_err(|_| err("ubtc_amount must parse as a number"))?;
     let destination = req["destination_address"].as_str().ok_or_else(|| err("destination_address required"))?;
     let challenge_id = req["challenge_id"].as_str().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"challenge_id required"}))))?;
     let signature = req["signature"].as_str().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"signature required (ML-DSA-65)"}))))?;
@@ -3124,7 +3125,7 @@ async fn redeem_ubtc(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"no wallet linked to vault"}))))?
         .get("wallet_address");
-    let params = format!("{}|{}|{}", vault_id, destination, ubtc_amount);
+    let params = format!("{}|{}|{}", vault_id, destination, ubtc_amount_str);
     verify_quantum_challenge(&pool, challenge_id, &owner_wallet, "redeem_ubtc", &params, signature, sphincs_signature).await?;
 
     // Get BTC price
