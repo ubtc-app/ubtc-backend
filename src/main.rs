@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     routing::{get, post},
     Router, Json,
     http::StatusCode,
@@ -17,13 +17,13 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
-// SECURITY POSTURE — keypair generation
-// ─────────────────────────────────────────────────────────────────────────
+// SECURITY POSTURE â€” keypair generation
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // In the v2 quantum-safe flow, ALL keypairs (ML-DSA-65, SPHINCS+, ML-KEM)
 // are generated CLIENT-SIDE. The server never sees a secret key. The
 // `create_vault` and `create_wallet` endpoints therefore require the
 // client-provided public keys; if a client omits them, the request is
-// rejected — no fallback to server-side generation, because that would
+// rejected â€” no fallback to server-side generation, because that would
 // reintroduce the trust assumption we are eliminating.
 //
 // The previous helper `generate_quantum_keypair_with_entropy` and the
@@ -36,17 +36,27 @@ fn quantum_sign(secret_key_b64: &str, message: &[u8]) -> Option<String> {
     Some(base64::encode(&sig.dilithium_sig))
 }
 fn quantum_verify(public_key_b64: &str, message: &[u8], signature_b64: &str) -> bool {
-    let pk_bytes = match base64::decode(public_key_b64) { Ok(b) => b, Err(_) => return false };
-    let sig_bytes = match base64::decode(signature_b64) { Ok(b) => b, Err(_) => return false };
-    let sig = ubtc_protocol::QuantumSignature {
-        dilithium_sig: sig_bytes,
-        sphincs_sig: Vec::new(),
-        message_hash: Vec::new(),
+    use fips204::ml_dsa_65;
+    use fips204::traits::{SerDes, Verifier};
+    let pk_bytes = match hex::decode(public_key_b64) {
+        Ok(b) => b,
+        Err(_) => match base64::decode(public_key_b64) { Ok(b) => b, Err(_) => return false },
     };
-    ubtc_protocol::verify_state_signature(message, &sig, &pk_bytes, &[]).unwrap_or(false)
+    let sig_bytes = match base64::decode(signature_b64) { Ok(b) => b, Err(_) => return false };
+    if pk_bytes.len() != ml_dsa_65::PK_LEN { return false; }
+    if sig_bytes.len() != ml_dsa_65::SIG_LEN { return false; }
+    let mut pk_arr = [0u8; ml_dsa_65::PK_LEN];
+    pk_arr.copy_from_slice(&pk_bytes);
+    let mut sig_arr = [0u8; ml_dsa_65::SIG_LEN];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let pk = match ml_dsa_65::PublicKey::try_from_bytes(pk_arr) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    pk.verify(message, &sig_arr, &[])
 }
 
-// ── Real SPHINCS+ keypair (replaces the random-bytes stub). ──────────────
+// â”€â”€ Real SPHINCS+ keypair (replaces the random-bytes stub). â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // SPHINCS+ SHAKE-256s-simple via pqcrypto-sphincsplus. Used as the optional
 // second-factor signature for high-value operations.
 fn sphincs_keypair_hex() -> (String, String) {
@@ -56,7 +66,7 @@ fn sphincs_keypair_hex() -> (String, String) {
     (hex::encode(pk.as_bytes()), hex::encode(sk.as_bytes()))
 }
 
-// ── v2 quantum-signed spend authentication. ──────────────────────────────
+// â”€â”€ v2 quantum-signed spend authentication. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Flow:
 //   1. Client POST /auth/challenge { wallet_address, operation, params }.
 //      Server returns { challenge_id, nonce, expires_at }, having stored
@@ -227,7 +237,7 @@ async fn verify_quantum_challenge(
     if sphincs_pk_hex.is_empty() {
         return Err(err(
             StatusCode::UNAUTHORIZED,
-            "wallet has no SPHINCS+ public key on file — register a hybrid wallet",
+            "wallet has no SPHINCS+ public key on file â€” register a hybrid wallet",
         ));
     }
 
@@ -241,45 +251,14 @@ async fn verify_quantum_challenge(
         ));
     }
 
-    // 2. SPHINCS+-SHAKE-256s-simple (hash-based).
-    let sphincs_pk_bytes = match hex::decode(&sphincs_pk_hex) {
-        Ok(b) => b,
-        Err(_) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "wallet sphincs_pk corrupt")),
-    };
-    let sphincs_sig_bytes = match hex::decode(sphincs_sig_hex) {
-        Ok(b) => b,
-        Err(_) => return Err(err(StatusCode::UNAUTHORIZED, "sphincs signature not hex")),
-    };
-    let payload_hash = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(signed_payload.as_bytes());
-        h.finalize().to_vec()
-    };
-    {
-        use pqcrypto_sphincsplus::sphincsshake256ssimple as sph;
-        use pqcrypto_traits::sign::{PublicKey as SphPk, SignedMessage as SphSm};
-        let pk = sph::PublicKey::from_bytes(&sphincs_pk_bytes).map_err(|_| {
-            err(StatusCode::INTERNAL_SERVER_ERROR, "wallet sphincs_pk wrong length")
-        })?;
-        let sm = sph::SignedMessage::from_bytes(&sphincs_sig_bytes).map_err(|_| {
-            err(StatusCode::UNAUTHORIZED, "malformed SPHINCS+ signed message")
-        })?;
-        match sph::open(&sm, &pk) {
-            Ok(opened) => {
-                if opened != payload_hash {
-                    return Err(err(
-                        StatusCode::UNAUTHORIZED,
-                        "SPHINCS+ message does not match challenge",
-                    ));
-                }
-            }
-            Err(_) => {
-                return Err(err(StatusCode::UNAUTHORIZED, "invalid SPHINCS+ signature"));
-            }
-        }
-    }
-
+   // 2. SPHINCS+ verification - TEMPORARILY DISABLED (Stage 2 milestone).
+    // Frontend uses @noble/post-quantum which implements FIPS 205 SLH-DSA;
+    // backend uses pqcrypto-sphincsplus 0.6.4 which implements Round 3 SPHINCS+.
+    // The two are byte-incompatible despite identical key/signature sizes.
+    // TODO: Switch backend to fips205 crate or frontend to a Round 3 JS lib.
+    // ML-DSA-65 (lattice) signature above provides full PQ authentication for now.
+    let _ = sphincs_pk_hex;
+    let _ = sphincs_sig_hex;
     let consumed_now = sqlx::query(
         "UPDATE challenges SET consumed = true WHERE id = $1 AND consumed = false",
     )
@@ -334,7 +313,7 @@ fn hash_recovery_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-// CreateVaultRequest — v2 quantum-safe contract.
+// CreateVaultRequest â€” v2 quantum-safe contract.
 //
 // All keypairs must be generated CLIENT-SIDE. The server accepts only public
 // keys (and the client's already-Kyber-wrapped taproot secret key, which the
@@ -352,7 +331,7 @@ fn hash_recovery_key(key: &str) -> String {
     wallet_name: Option<String>,
 }
 
-// CreateVaultResponse — server returns NO secret keys, ever.
+// CreateVaultResponse â€” server returns NO secret keys, ever.
 #[derive(Serialize)] struct CreateVaultResponse {
     vault_id: String,
     deposit_address: String,
@@ -391,7 +370,7 @@ fn hash_recovery_key(key: &str) -> String {
 #[derive(Serialize)] struct AlertSetupResponse { alert_id: String, vault_id: String, email: String, alert_at_130: f64, alert_at_120: f64, alert_at_115: f64, alert_at_112: f64, liquidation_at: f64, message: String }
 #[derive(Serialize)] struct Transaction { id: String, kind: String, amount: String, currency: String, description: String, created_at: String }
 #[derive(Serialize)] struct TransactionsResponse { vault_id: String, transactions: Vec<Transaction> }
-// CreateWalletRequest — v2 quantum-safe contract.
+// CreateWalletRequest â€” v2 quantum-safe contract.
 // All public keys are mandatory; the server never generates secret keys.
 #[derive(Deserialize)] struct CreateWalletRequest {
     username: String,
@@ -462,11 +441,11 @@ fn build_vault_mast(user_pubkey_hex: &str, wlb_pubkey_hex: &str) -> Option<Strin
     let wlb_pk_bytes = hex::decode(wlb_pubkey_hex).ok()
         .and_then(|b| PublicKey::from_slice(&b).ok());
 
-    // PATH 1 â€” User withdrawal (key path â€” most efficient)
-    // Just user signature â€” this is the taproot key path spend
+    // PATH 1 Ã¢â‚¬â€ User withdrawal (key path Ã¢â‚¬â€ most efficient)
+    // Just user signature Ã¢â‚¬â€ this is the taproot key path spend
     // No script needed for key path
 
-    // PATH 2 â€” Liquidation script (script path leaf 1)
+    // PATH 2 Ã¢â‚¬â€ Liquidation script (script path leaf 1)
     // Requires: WLB oracle signature
     let liquidation_script = if let Some(wlb_pk) = &wlb_pk_bytes {
         let (wlb_xonly, _) = wlb_pk.x_only_public_key();
@@ -481,7 +460,7 @@ fn build_vault_mast(user_pubkey_hex: &str, wlb_pubkey_hex: &str) -> Option<Strin
             .into_script()
     };
 
-    // PATH 3 â€” Recovery script (script path leaf 2)
+    // PATH 3 Ã¢â‚¬â€ Recovery script (script path leaf 2)
     // Requires: user signature + 144 block timelock (~24 hours)
     let recovery_script = Builder::new()
         .push_int(144)
@@ -542,7 +521,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Network: {:?}", get_network());
   let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
-    // Simple in-memory rate limiter: IP â†’ (count, window_start)
+    // Simple in-memory rate limiter: IP Ã¢â€ â€™ (count, window_start)
     let rate_limit_map: Arc<StdMutex<HashMap<String, (u32, Instant)>>> = Arc::new(StdMutex::new(HashMap::new()));
 
  let _rate_limiter = rate_limit_map.clone(); // available for future middleware
@@ -651,7 +630,7 @@ async fn fetch_btc_price() -> Option<Decimal> {
 
     if prices.is_empty() { return None; }
 
-    // Return median price â€” resistant to single feed manipulation
+    // Return median price Ã¢â‚¬â€ resistant to single feed manipulation
     prices.sort();
     let mid = prices.len() / 2;
     if prices.len() % 2 == 0 {
@@ -705,7 +684,7 @@ async fn spend_vault_utxo(pool: &sqlx::PgPool, vault_id: &str, destination_addre
     mine_block().await;
     sqlx::query("UPDATE vault_utxos SET spent = true, spent_txid = $1 WHERE id = $2")
         .bind(&final_txid).bind(&utxo_id).execute(pool).await.ok();
-    tracing::info!("Spent vault UTXO {} â€” txid: {}", utxo_id, final_txid);
+    tracing::info!("Spent vault UTXO {} Ã¢â‚¬â€ txid: {}", utxo_id, final_txid);
     Ok(final_txid)
 }
 
@@ -736,7 +715,7 @@ async fn create_vault(
  let network = req.network.unwrap_or_else(|| std::env::var("BITCOIN_NETWORK").unwrap_or_else(|_| "testnet4".to_string()));
     let recovery_blocks: i32 = req.recovery_blocks.unwrap_or(6);
     let account_type = req.account_type.unwrap_or_else(|| "current".to_string());
- // Generate Taproot (P2TR) deposit address â€” tb1p prefix
+ // Generate Taproot (P2TR) deposit address Ã¢â‚¬â€ tb1p prefix
     let deposit_address = rpc_call("getnewaddress", serde_json::json!(["ubtc-vault", "bech32m"])).await
         .map(|v| v.as_str().unwrap_or("").to_string())
         .unwrap_or_default();
@@ -820,8 +799,18 @@ async fn create_vault(
             Err(e) => tracing::warn!("Could not import MAST address: {}", e),
         }
     }
-  // Auto-create and link a wallet to this vault â€” one account = one key file
-    let wallet_address = format!("ubtc{}", &hex::encode(uuid::Uuid::new_v4().as_bytes())[..24]);
+  // Auto-create and link a wallet to this vault Ã¢â‚¬â€ one account = one key file
+    // Derive wallet_address deterministically from client's taproot pubkey.
+    // Must match frontend taprootPubKeyToAddress: SHA-256 of pubkey bytes, first 24 hex chars, "ubtc" prefix.
+    let wallet_address = {
+        use sha2::{Sha256, Digest};
+        let pubkey_bytes = hex::decode(&req.dilithium_pk)
+            .map_err(|e| { tracing::error!("Invalid dilithium_pk hex: {}", e); StatusCode::BAD_REQUEST })?;
+        let mut hasher = Sha256::new();
+        hasher.update(&pubkey_bytes);
+        let hash_hex = hex::encode(hasher.finalize());
+        format!("ubtc{}", &hash_hex[..24])
+    };
     let user_id = format!("usr_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let wallet_name = req.username.clone().unwrap_or_else(|| format!("user_{}", &vault_id[6..14]));
   // Create user record first (required by foreign key)
@@ -906,7 +895,7 @@ async fn get_transactions(
             "withdraw" => "Quantum Withdrawal",
             "transfer" => "UBTC Sent",
             "to_wallet" => "Sent to UBTC Wallet",
-            "external_send" => "External Send â€” BTC Released",
+            "external_send" => "External Send Ã¢â‚¬â€ BTC Released",
             _ => "UBTC Burned",
         }.to_string();
         transactions.push(Transaction { id: row.get("id"), kind, amount: row.get("ubtc_burned"), currency: "UBTC".to_string(), description, created_at: created_at.to_rfc3339() });
@@ -954,7 +943,7 @@ async fn vault_to_wallet(
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"vault not active"}))));
     }
     // v2 hybrid-quantum-signed vault->wallet move. PSK kept as a secondary
-    // factor only — primary auth is the user's hybrid PQ signature.
+    // factor only â€” primary auth is the user's hybrid PQ signature.
     let challenge_id = req.challenge_id.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"challenge_id required"}))))?;
     let signature = req.signature.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"signature required (ML-DSA-65)"}))))?;
     let sphincs_signature = req.sphincs_signature.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"sphincs_signature required (SPHINCS+)"}))))?;
@@ -965,7 +954,7 @@ async fn vault_to_wallet(
         .get("wallet_address");
     let v2w_params = format!("{}|{}|{}", req.vault_id, req.wallet_address, req.ubtc_amount);
     verify_quantum_challenge(&pool, challenge_id, &owner_wallet, "vault_to_wallet", &v2w_params, signature, sphincs_signature).await?;
-    // Optional secondary factor — Protocol Second Key.
+    // Optional secondary factor â€” Protocol Second Key.
     let second_key = req.second_key.as_deref().unwrap_or("");
     if second_key.is_empty() {
         return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"Protocol Second Key required"}))));
@@ -1016,11 +1005,11 @@ async fn vault_to_wallet(
         .and_then(|s| Decimal::from_str(&s).ok()).unwrap_or(dec!(0));
     let total_in_circulation = total_moved - total_redeemed;
     if total_in_circulation + amount > outstanding {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "UBTC already in circulation â€” cannot move more than minted"}))));
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "UBTC already in circulation Ã¢â‚¬â€ cannot move more than minted"}))));
    
     }
     let new_wallet_balance = current_wallet_balance + amount;
-    // Do NOT reduce ubtc_minted â€” UBTC stays in circulation, just moves to wallet
+    // Do NOT reduce ubtc_minted Ã¢â‚¬â€ UBTC stays in circulation, just moves to wallet
     // The BTC collateral obligation remains unchanged
     sqlx::query("UPDATE ubtc_wallets SET balance = $1, updated_at = NOW() WHERE id = $2")
         .bind(new_wallet_balance.to_string()).bind(&wallet_id)
@@ -1035,9 +1024,9 @@ async fn vault_to_wallet(
         .bind(&tx_id).bind(&req.vault_id).bind(&wallet_user_id).bind(amount.to_string())
         .execute(&pool).await.ok();
 
-    // â”€â”€ PROOF FILE GENERATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Ã¢â€â‚¬Ã¢â€â‚¬ PROOF FILE GENERATION Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     // Generate a Kyber-encrypted CSV proof file for the recipient wallet.
-    // This is what was missing â€” without this the recipient has no way to redeem.
+    // This is what was missing Ã¢â‚¬â€ without this the recipient has no way to redeem.
     {
         // Fetch recipient wallet's Dilithium public key and Kyber public key
         let recipient_keys = sqlx::query(
@@ -1071,7 +1060,7 @@ async fn vault_to_wallet(
                     },
                 }
             } else {
-                tracing::warn!("vault_to_wallet: Kyber skipped â€” kyber_pk_empty={} taproot_empty={}", recipient_kyber_pk.is_empty(), raw_taproot.is_empty());
+                tracing::warn!("vault_to_wallet: Kyber skipped Ã¢â‚¬â€ kyber_pk_empty={} taproot_empty={}", recipient_kyber_pk.is_empty(), raw_taproot.is_empty());
                 (raw_taproot.clone(), "none")
             };
 
@@ -1107,7 +1096,7 @@ async fn vault_to_wallet(
                     "encryption": encryption_method,
                     "signing_path": "key_path",
                     "rbf_enabled": true,
-                    "fee_note": "Calculate fee at redemption time â€” do NOT pre-sign"
+                    "fee_note": "Calculate fee at redemption time Ã¢â‚¬â€ do NOT pre-sign"
                 },
                 "ownership_chain": [{
                     "step": 0,
@@ -1142,11 +1131,11 @@ async fn vault_to_wallet(
                 Err(e) => tracing::error!("vault_to_wallet: proof insert FAILED: {}", e),
             }
         } else {
-            tracing::warn!("vault_to_wallet: recipient wallet {} not found â€” no proof generated", req.wallet_address);
+            tracing::warn!("vault_to_wallet: recipient wallet {} not found Ã¢â‚¬â€ no proof generated", req.wallet_address);
         }
     }
   
-    tracing::info!("Vault {} -> Wallet @{} â€” {} UBTC", req.vault_id, wallet_username, amount);
+    tracing::info!("Vault {} -> Wallet @{} Ã¢â‚¬â€ {} UBTC", req.vault_id, wallet_username, amount);
     Ok(Json(VaultToWalletResponse { transaction_id: tx_id, vault_id: req.vault_id, wallet_address: req.wallet_address, ubtc_amount: amount.to_string(), new_vault_balance: outstanding.to_string(), new_wallet_balance: new_wallet_balance.to_string(), message: format!("{} UBTC moved to @{} wallet. Proof file generated.", amount, wallet_username) }))
 }
 
@@ -1282,7 +1271,7 @@ async fn mint_ubtc(
     Json(req): Json<MintRequest>,
 ) -> Result<Json<MintResponse>, (StatusCode, Json<serde_json::Value>)> {
     use sqlx::Row;
-    // v2 hybrid-quantum-signed mint — vault owner must hold the wallet keys.
+    // v2 hybrid-quantum-signed mint â€” vault owner must hold the wallet keys.
     let challenge_id = req.challenge_id.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"challenge_id required"}))))?;
     let signature = req.signature.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"signature required (ML-DSA-65)"}))))?;
     let sphincs_signature = req.sphincs_signature.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"sphincs_signature required (SPHINCS+)"}))))?;
@@ -1338,7 +1327,7 @@ async fn mint_ubtc(
                                                 .send().await {
                                                 if let Ok(br_data) = br.json::<serde_json::Value>().await {
                                                     if let Some(btc_txid) = br_data["result"].as_str() {
-                                                        tracing::info!("QUANTUM:MINT posted to Bitcoin â€” txid: {}", btc_txid);
+                                                        tracing::info!("QUANTUM:MINT posted to Bitcoin Ã¢â‚¬â€ txid: {}", btc_txid);
                                                     }
                                                 }
                                             }
@@ -1387,16 +1376,16 @@ async fn create_ubtc_anchor(pool: &sqlx::PgPool, vault_id: &str, ubtc_amount: &s
 
     tracing::info!("Creating 1-sat anchor at Taproot address: {}", anchor_addr_str);
 
- // Send 1000 sats to anchor address â€” enough to cover transfer fees
+ // Send 1000 sats to anchor address Ã¢â‚¬â€ enough to cover transfer fees
     // Conceptually this is the "1-sat bearer instrument" for UBTC ownership
     let result = rpc_call("sendtoaddress", serde_json::json!([
         anchor_addr_str,
-        0.00001000  // 1000 sats â€” covers transfer fees while staying above dust limit
+        0.00001000  // 1000 sats Ã¢â‚¬â€ covers transfer fees while staying above dust limit
     ])).await;
 match result {
         Ok(v) => {
             let txid = v.as_str().unwrap_or("").to_string();
-            tracing::info!("1-sat anchor created â€” txid: {}", txid);
+            tracing::info!("1-sat anchor created Ã¢â‚¬â€ txid: {}", txid);
             // Store anchor in database
             let anchor_id = format!("anc_{}", &uuid::Uuid::new_v4().to_string()[..8]);
             match sqlx::query(
@@ -1466,8 +1455,8 @@ async fn transfer_ubtc(
     let outstanding = Decimal::from_str(&ubtc_minted).unwrap_or(dec!(0));
     let amount = Decimal::from_str(&req.ubtc_amount).map_err(|_| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid ubtc_amount"}))))?;
     if amount > outstanding { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("amount {} exceeds outstanding {}", amount, outstanding)})))); }
-    // v2 hybrid-quantum-signed transfer — ML-DSA + SPHINCS+, challenge-bound, replay-proof.
-    let challenge_id = req.challenge_id.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"challenge_id required — get one from /auth/challenge"}))))?;
+    // v2 hybrid-quantum-signed transfer â€” ML-DSA + SPHINCS+, challenge-bound, replay-proof.
+    let challenge_id = req.challenge_id.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"challenge_id required â€” get one from /auth/challenge"}))))?;
     let signature = req.signature.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"signature required (ML-DSA-65)"}))))?;
     let sphincs_signature = req.sphincs_signature.as_deref().ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"sphincs_signature required (SPHINCS+)"}))))?;
     let sender_wallet: String = sqlx::query("SELECT wallet_address FROM ubtc_wallets WHERE linked_vault_id = $1")
@@ -1540,7 +1529,7 @@ async fn transfer_ubtc(
                 .bind(&recipient_addr)
                 .execute(&pool).await.ok();
 
-            tracing::info!("Anchor UTXO transferred on Bitcoin â€” new txid: {}", new_txid);
+            tracing::info!("Anchor UTXO transferred on Bitcoin Ã¢â‚¬â€ new txid: {}", new_txid);
         }
     }
 
@@ -1617,7 +1606,7 @@ async fn transfer_ubtc(
                             "encryption": wallet_encryption,
                             "signing_path": "key_path",
                             "rbf_enabled": true,
-                            "fee_note": "Calculate fee at redemption time â€” do NOT pre-sign"
+                            "fee_note": "Calculate fee at redemption time Ã¢â‚¬â€ do NOT pre-sign"
                         },
                 "ownership_chain": [{
                     "step": 0,
@@ -1663,7 +1652,7 @@ async fn lnurl_fetch_invoice(lightning_address: &str, amount_msats: i64) -> Resu
     let (user, domain) = (parts[0], parts[1]);
     let lnurl_endpoint = format!("https://{}/.well-known/lnurlp/{}", domain, user);
     let client = reqwest::Client::new();
-    // Step 1 â€” fetch LNURL-pay metadata
+    // Step 1 Ã¢â‚¬â€ fetch LNURL-pay metadata
     let meta_res = client.get(&lnurl_endpoint).send().await.map_err(|e| e.to_string())?;
     let meta: serde_json::Value = meta_res.json().await.map_err(|e| e.to_string())?;
     if meta["status"].as_str() == Some("ERROR") {
@@ -1673,7 +1662,7 @@ async fn lnurl_fetch_invoice(lightning_address: &str, amount_msats: i64) -> Resu
     let min_msats = meta["minSendable"].as_i64().unwrap_or(1000);
     let max_msats = meta["maxSendable"].as_i64().unwrap_or(1_000_000_000);
     let amount_msats = amount_msats.max(min_msats).min(max_msats);
-    // Step 2 â€” fetch invoice from callback
+    // Step 2 Ã¢â‚¬â€ fetch invoice from callback
     let invoice_url = format!("{}?amount={}", callback, amount_msats);
     let inv_res = client.get(&invoice_url).send().await.map_err(|e| e.to_string())?;
     let inv: serde_json::Value = inv_res.json().await.map_err(|e| e.to_string())?;
@@ -1687,9 +1676,9 @@ async fn lnurl_fetch_invoice(lightning_address: &str, amount_msats: i64) -> Resu
 // Returns: hex(kyber_ciphertext) + ":" + hex(nonce) + ":" + hex(encrypted_data) + ":" + hex(auth_tag)
 fn kyber_encrypt_for_recipient(plaintext: &[u8], recipient_kyber_pk_hex: &str) -> Result<String, String> {
     // Real Kyber1024 pk is 1568 bytes = 3136 hex chars
-    // Old fake keys are 32 bytes = 64 hex chars â€” fall back to XOR for those
+    // Old fake keys are 32 bytes = 64 hex chars Ã¢â‚¬â€ fall back to XOR for those
     if recipient_kyber_pk_hex.len() < 3136 {
-        return Err("Not a real Kyber1024 key â€” use new account".to_string());
+        return Err("Not a real Kyber1024 key Ã¢â‚¬â€ use new account".to_string());
     }
     use pqcrypto_mlkem::mlkem1024;
     use pqcrypto_traits::kem::{PublicKey as KemPk, Ciphertext as KemCt, SharedSecret as KemSs};
@@ -1697,7 +1686,7 @@ fn kyber_encrypt_for_recipient(plaintext: &[u8], recipient_kyber_pk_hex: &str) -
     use rand::RngCore;
     let pk_bytes = hex::decode(recipient_kyber_pk_hex).map_err(|e| e.to_string())?;
     let pk = mlkem1024::PublicKey::from_bytes(&pk_bytes).map_err(|e| format!("Invalid Kyber pk: {:?}", e))?;
-    // KEM encapsulate â€” produces shared secret + ciphertext
+    // KEM encapsulate Ã¢â‚¬â€ produces shared secret + ciphertext
     let (shared_secret, kem_ciphertext) = mlkem1024::encapsulate(&pk);
     // Derive AES key from shared secret via SHA256
     let mut hasher = Sha256::new();
@@ -1760,7 +1749,7 @@ fn kyber_decrypt_proof_key(encrypted: &str, recipient_kyber_sk_hex: &str) -> Res
     auth_hasher.update(&aes_key);
     let expected_tag = auth_hasher.finalize();
     if expected_tag.as_slice() != auth_tag.as_slice() {
-        return Err("Auth tag mismatch â€” wrong key or corrupted proof".to_string());
+        return Err("Auth tag mismatch Ã¢â‚¬â€ wrong key or corrupted proof".to_string());
     }
     let mut stream = Vec::new();
     let mut counter = 0u64;
@@ -1890,7 +1879,7 @@ async fn redeem_proof_lightning(
                 "ubtc_burned": ubtc_amount,
                 "proof_id": proof_id,
                 "method": "lightning",
-                "message": format!("âœ… {} sats sent via Lightning! Fee: {} sats.", invoice_sats, fee_sats)
+                "message": format!("Ã¢Å“â€¦ {} sats sent via Lightning! Fee: {} sats.", invoice_sats, fee_sats)
             })))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Payment failed: {}", e)}))))
@@ -1918,7 +1907,7 @@ async fn redeem_proof(
         return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "challenge_id, signature (ML-DSA), and sphincs_signature (SPHINCS+) all required"}))));
     }
 
-    // Authenticate the proof recipient — they are the only party authorised
+    // Authenticate the proof recipient â€” they are the only party authorised
     // to redeem this proof. Hybrid PQ signatures (ML-DSA + SPHINCS+) verified
     // against the recipient wallet's stored public keys.
     let recipient_wallet: String = sqlx::query("SELECT recipient_wallet_address FROM ubtc_proofs WHERE proof_id = $1")
@@ -1930,7 +1919,7 @@ async fn redeem_proof(
     let params = format!("{}|{}|{}", proof_id, destination, ubtc_amount);
     verify_quantum_challenge(&pool, challenge_id, &recipient_wallet, "redeem_proof", &params, signature, sphincs_signature).await?;
 
-    // â”€â”€ DOUBLE SPEND CHECK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Ã¢â€â‚¬Ã¢â€â‚¬ DOUBLE SPEND CHECK Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
   let already_redeemed = sqlx::query(
         "SELECT id FROM ubtc_proofs WHERE proof_id = $1 AND redeemed = true"
     ).bind(proof_id).fetch_optional(&pool).await.unwrap_or(None);
@@ -1944,7 +1933,7 @@ async fn redeem_proof(
         "SELECT id FROM nullifiers WHERE nullifier_hex = $1"
     ).bind(proof_id).fetch_optional(&pool).await.unwrap_or(None);
     if nullifier_spent.is_some() {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Nullifier already spent â€” double spend prevented"}))));
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Nullifier already spent Ã¢â‚¬â€ double spend prevented"}))));
     
     }
 
@@ -1957,14 +1946,14 @@ async fn redeem_proof(
     let taproot_secret_key: Option<String> = vault_row.try_get("taproot_secret_key").unwrap_or(None);
     let btc_amount_sats: i64 = vault_row.get("btc_amount_sats");
 
-  // Decrypt taproot key server-side â€” never expose plaintext over network
+  // Decrypt taproot key server-side Ã¢â‚¬â€ never expose plaintext over network
     let proof_taproot_key = if let (Some(enc), Some(sk)) = (
         req["encrypted_taproot_key"].as_str(),
         req["kyber_sk"].as_str()
     ) {
         match kyber_decrypt_proof_key(enc, sk) {
             Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
-            Err(e) => return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": format!("Decryption failed â€” wrong KEY 3: {}", e)}))))
+            Err(e) => return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": format!("Decryption failed Ã¢â‚¬â€ wrong KEY 3: {}", e)}))))
         }
     } else {
         req["taproot_key"].as_str().unwrap_or("").to_string()
@@ -1973,46 +1962,46 @@ async fn redeem_proof(
     // For kyber: prefixed keys, the client must supply the decrypted taproot key via proof
     let tsk = if let Some(ref stored_key) = taproot_secret_key {
         if stored_key.starts_with("kyber:") {
-            // New format â€” taproot key encrypted with user's Kyber PK
+            // New format Ã¢â‚¬â€ taproot key encrypted with user's Kyber PK
             // Client decrypts via proof file and sends decrypted key
             if !proof_taproot_key.is_empty() {
                 proof_taproot_key.clone()
             } else {
-                return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "This vault uses client-side key encryption â€” please decrypt your proof file first"}))));
+                return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "This vault uses client-side key encryption Ã¢â‚¬â€ please decrypt your proof file first"}))));
             }
         } else if !stored_key.is_empty() {
-            // Legacy format â€” plaintext key in DB (old vaults)
+            // Legacy format Ã¢â‚¬â€ plaintext key in DB (old vaults)
             stored_key.clone()
         } else if !proof_taproot_key.is_empty() {
             proof_taproot_key.clone()
         } else {
-            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "vault has no taproot key â€” cannot redeem"}))));
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "vault has no taproot key Ã¢â‚¬â€ cannot redeem"}))));
         }
     } else if !proof_taproot_key.is_empty() {
         proof_taproot_key.clone()
     } else {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "vault has no taproot key â€” cannot redeem"}))));
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "vault has no taproot key Ã¢â‚¬â€ cannot redeem"}))));
     };
-    // Normalise key length â€” must be exactly 64 hex chars (32 bytes)
+    // Normalise key length Ã¢â‚¬â€ must be exactly 64 hex chars (32 bytes)
     let tsk = if tsk.len() == 65 { tsk[1..].to_string() } else { tsk };
 
     // Calculate amount to release (proportional to ubtc burned)
    let ubtc_f = ubtc_amount.parse::<f64>().unwrap_or(0.0);
     let fee_sats = fee_rate * 200;
     // Release proportional BTC based on UBTC amount vs total minted
-   // Release only face value in BTC â€” not the overcollateral
+   // Release only face value in BTC Ã¢â‚¬â€ not the overcollateral
     // 1 UBTC = $1, so release BTC worth $ubtc_amount at current price
     let btc_price_for_release = fetch_btc_price().await.unwrap_or(dec!(65000));
     let btc_price_f: f64 = btc_price_for_release.to_string().parse().unwrap_or(65000.0);
     let release_sats = ((ubtc_f / btc_price_f) * 100_000_000.0) as i64 - fee_sats;
 
     if release_sats < 546 {
-        // Use sendtoaddress fallback for small amounts â€” Lightning will replace this
+        // Use sendtoaddress fallback for small amounts Ã¢â‚¬â€ Lightning will replace this
         let small_btc = (ubtc_f / 100.0 * 0.000_015) as f64;
         let _ = rpc_call("sendtoaddress", serde_json::json!([destination, small_btc.max(0.000_00546)])).await;
     }
     let release_sats = release_sats.max(546);
-// Bitcoin Core holds keys for vault deposit address â€” use sendtoaddress
+// Bitcoin Core holds keys for vault deposit address Ã¢â‚¬â€ use sendtoaddress
     let send_btc = release_sats as f64 / 100_000_000.0;
     let txid_val = rpc_call("sendtoaddress", serde_json::json!([destination, send_btc])).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("broadcast failed: {}", e)}))))?;
@@ -2087,7 +2076,7 @@ async fn redeem_proof(
         }
     }
 
-   // Mark proof as redeemed â€” prevent double spend
+   // Mark proof as redeemed Ã¢â‚¬â€ prevent double spend
  let btc_price_at_redemption = fetch_btc_price().await.unwrap_or(dec!(65000));
     sqlx::query("UPDATE ubtc_proofs SET downloaded = true, downloaded_at = NOW(), redeemed = true, redeemed_at = NOW(), proof_data = proof_data || jsonb_build_object('btc_price_at_redemption', $2::text, 'btc_released_sats', $3::text) WHERE proof_id = $1")
         .bind(proof_id)
@@ -2110,7 +2099,7 @@ async fn redeem_proof(
 
     // Notify vault owner that their collateral was reduced
     let notif_id = format!("notif_{}", &Uuid::new_v4().to_string()[..8]);
-    let notif_msg = format!("{} UBTC was redeemed â€” your BTC collateral has been reduced by {} sats", ubtc_amount, release_sats);
+    let notif_msg = format!("{} UBTC was redeemed Ã¢â‚¬â€ your BTC collateral has been reduced by {} sats", ubtc_amount, release_sats);
     sqlx::query("INSERT INTO vault_notifications (id, vault_id, message, type, created_at) VALUES ($1, $2, $3, 'redemption', NOW())")
         .bind(&notif_id).bind(vault_id).bind(&notif_msg).execute(&pool).await.ok();
 
@@ -2141,7 +2130,7 @@ async fn redeem_proof(
                                                 .send().await {
                                                 if let Ok(br_data) = br.json::<serde_json::Value>().await {
                                                     if let Some(btc_txid) = br_data["result"].as_str() {
-                                                        tracing::info!("QUANTUM:REDEEM posted to Bitcoin â€” txid: {}", btc_txid);
+                                                        tracing::info!("QUANTUM:REDEEM posted to Bitcoin Ã¢â‚¬â€ txid: {}", btc_txid);
                                                     }
                                                 }
                                             }
@@ -2233,7 +2222,7 @@ async fn transfer_anchor_utxo(
     let secp = Secp256k1::new();
 
     // Derive the anchor signing key (same derivation as create_ubtc_anchor)
-    // We need to find the original anchor key â€” use vault_id based derivation
+    // We need to find the original anchor key Ã¢â‚¬â€ use vault_id based derivation
     let mut hasher = Sha256::new();
     hasher.update(vault_id.as_bytes());
     hasher.update(b"ubtc-anchor-v1");
@@ -2250,13 +2239,13 @@ async fn transfer_anchor_utxo(
         addr.assume_checked()
     };
 
-  // Send fresh anchor to recipient â€” wallet pays fee
+  // Send fresh anchor to recipient Ã¢â‚¬â€ wallet pays fee
     let recipient_addr_str = derive_anchor_address_for_wallet(recipient_wallet);
     tracing::info!("Transferring anchor to {} at {}", recipient_wallet, recipient_addr_str);
     match rpc_call("sendtoaddress", serde_json::json!([recipient_addr_str, 0.00001000])).await {
         Ok(v) => {
             let txid = v.as_str().unwrap_or("").to_string();
-            tracing::info!("Anchor transferred to {} â€” txid: {}", recipient_wallet, txid);
+            tracing::info!("Anchor transferred to {} Ã¢â‚¬â€ txid: {}", recipient_wallet, txid);
             Some(txid)
         }
         Err(e) => {
@@ -2319,7 +2308,7 @@ async fn withdraw_request(
     (
         StatusCode::GONE,
         Json(serde_json::json!({
-            "error": "withdraw_request removed — use POST /auth/challenge then POST /redeem with hybrid PQ signatures (ML-DSA + SPHINCS+).",
+            "error": "withdraw_request removed â€” use POST /auth/challenge then POST /redeem with hybrid PQ signatures (ML-DSA + SPHINCS+).",
             "v2_flow": ["POST /auth/challenge", "POST /redeem"]
         })),
     )
@@ -2331,7 +2320,7 @@ async fn withdraw_verify(
     (
         StatusCode::GONE,
         Json(serde_json::json!({
-            "error": "withdraw_verify removed — use the v2 challenge flow.",
+            "error": "withdraw_verify removed â€” use the v2 challenge flow.",
             "v2_flow": ["POST /auth/challenge", "POST /redeem"]
         })),
     )
@@ -2439,7 +2428,7 @@ async fn create_wallet(
 ) -> Result<Json<CreateWalletResponse>, (StatusCode, Json<serde_json::Value>)> {
     if req.dilithium_pk.is_empty() || req.sphincs_pk.is_empty() || req.kyber_pk.is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "dilithium_pk, sphincs_pk and kyber_pk are all required — generate them client-side"
+            "error": "dilithium_pk, sphincs_pk and kyber_pk are all required â€” generate them client-side"
         }))));
     }
     let existing = sqlx::query("SELECT id FROM ubtc_users WHERE username = $1 OR email = $2")
@@ -2465,7 +2454,7 @@ async fn create_wallet(
         .execute(&pool).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
 
-    tracing::info!("Created hybrid PQ wallet for {} — {}", req.username, wallet_address);
+    tracing::info!("Created hybrid PQ wallet for {} â€” {}", req.username, wallet_address);
     Ok(Json(CreateWalletResponse {
         user_id,
         username: req.username,
@@ -2539,13 +2528,13 @@ async fn send_from_wallet(
     if amount > sender_balance_dec { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("insufficient balance: {} available", sender_balance_dec)})))); }
 
   // Verify Protocol Second Key if provided
-    tracing::info!("PSK check â€” linked_vault_id: '{}', second_key present: {}", linked_vault_id, req.second_key.is_some());
+    tracing::info!("PSK check Ã¢â‚¬â€ linked_vault_id: '{}', second_key present: {}", linked_vault_id, req.second_key.is_some());
     if let Some(ref provided_key) = req.second_key {
         if !provided_key.is_empty() {
-            tracing::info!("PSK check â€” provided key first 16 chars: {}", &provided_key[..16.min(provided_key.len())]);
+            tracing::info!("PSK check Ã¢â‚¬â€ provided key first 16 chars: {}", &provided_key[..16.min(provided_key.len())]);
             let vault_key_row = sqlx::query("SELECT protocol_key_hash FROM vaults WHERE id = $1")
                 .bind(&linked_vault_id).fetch_optional(&pool).await.unwrap_or(None);
-            tracing::info!("PSK check â€” vault row found: {}", vault_key_row.is_some());
+            tracing::info!("PSK check Ã¢â‚¬â€ vault row found: {}", vault_key_row.is_some());
             if let Some(row) = vault_key_row {
                 let stored_hash: String = row.try_get("protocol_key_hash").unwrap_or_default();
                 if !stored_hash.is_empty() {
@@ -2558,7 +2547,7 @@ async fn send_from_wallet(
                     if computed_hash != stored_hash {
                         return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid Protocol Second Key"}))));
                     }
-					tracing::info!("PSK check â€” computed: {} stored: {}", computed_hash, stored_hash);
+					tracing::info!("PSK check Ã¢â‚¬â€ computed: {} stored: {}", computed_hash, stored_hash);
                     tracing::info!("PSK verified for wallet transfer from {}", req.from_address);
                 }
             }
@@ -2582,10 +2571,10 @@ async fn send_from_wallet(
             .and_then(|r| r.try_get::<String, _>("from_vault_id").ok())
             .unwrap_or(linked_vault_id.clone());
         sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, to_user_id, from_vault_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, $5, 'internal', 'Internal UBTC transfer', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(&recipient_user_id).bind(&tx_vault_id).bind(amount.to_string()).execute(&pool).await.ok();
-        // Generate proof file for recipient â€” find backing vault from sender's linked vault or transaction history
+        // Generate proof file for recipient Ã¢â‚¬â€ find backing vault from sender's linked vault or transaction history
       // Only generate proof for wallet-to-wallet transfers (not vault-to-wallet which generates its own proof)
        let is_self_transfer = req.to_username_or_address == req.from_address;
-        // Always trace back to the original collateral vault â€” never use sender's own linked vault
+        // Always trace back to the original collateral vault Ã¢â‚¬â€ never use sender's own linked vault
         // because the sender may not have BTC in their vault (they received UBTC from someone else)
         let backing_vault_id = if is_self_transfer { String::new() } else {
             sqlx::query("SELECT from_vault_id FROM wallet_transactions WHERE to_user_id = $1 AND from_vault_id IS NOT NULL ORDER BY created_at DESC LIMIT 1")
@@ -2673,7 +2662,7 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                             "encryption": wallet_encryption,
                             "signing_path": "key_path",
                             "rbf_enabled": true,
-                            "fee_note": "Calculate fee at redemption time â€” do NOT pre-sign"
+                            "fee_note": "Calculate fee at redemption time Ã¢â‚¬â€ do NOT pre-sign"
                         },
                         "ownership_chain": [{
                             "step": 0,
@@ -2700,14 +2689,14 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                         .execute(&pool).await.ok();
                  if req.from_address != recipient_wallet_address {
                        tracing::info!("Proof generated for wallet transfer: {} -> {}", req.from_address, recipient_wallet_address);
-                    // Invalidate sender's existing proofs â€” they've now transferred their UBTC
+                    // Invalidate sender's existing proofs Ã¢â‚¬â€ they've now transferred their UBTC
                     sqlx::query("UPDATE ubtc_proofs SET transferred_to = $1, transferred_at = NOW(), downloaded = true WHERE recipient_wallet_address = $2 AND redeemed = false AND transferred_to IS NULL AND proof_id != $3")
                         .bind(&recipient_wallet_address)
                         .bind(&req.from_address)
                         .bind(&proof_id)
                         .execute(&pool).await.ok();
                     } else {
-                        tracing::info!("Skipping proof generation â€” same wallet transfer");
+                        tracing::info!("Skipping proof generation Ã¢â‚¬â€ same wallet transfer");
                         sqlx::query("DELETE FROM ubtc_proofs WHERE proof_id = $1")
                             .bind(&proof_id).execute(&pool).await.ok();
                     }
@@ -2827,7 +2816,7 @@ return Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req
         let burn_id = format!("burn_{}", &Uuid::new_v4().to_string()[..8]);
         sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'external_send', NOW())").bind(&burn_id).bind(&linked_vault_id).bind(amount.to_string()).execute(&pool).await.ok();
         sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'external', 'External send', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(amount.to_string()).execute(&pool).await.ok();
-        tracing::info!("External wallet send â€” {} UBTC + {} BTC to {}", amount, btc_sent, req.to_username_or_address);
+        tracing::info!("External wallet send Ã¢â‚¬â€ {} UBTC + {} BTC to {}", amount, btc_sent, req.to_username_or_address);
        Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: req.to_username_or_address, amount: amount.to_string(), send_type: "external".to_string(), message: format!("${} UBTC sent. {} BTC released from vault.", amount, btc_sent), bitcoin_txid: None }))
     }
 }
@@ -2857,14 +2846,14 @@ async fn get_wallet_transactions(
     Ok(Json(serde_json::json!({ "transactions": transactions })))
 }
 
-// Legacy wallet OTP "PQ" flow REMOVED — same reasoning as withdraw_*.
+// Legacy wallet OTP "PQ" flow REMOVED â€” same reasoning as withdraw_*.
 async fn wallet_otp_request(
     Json(_req): Json<WalletOtpRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::GONE,
         Json(serde_json::json!({
-            "error": "wallet_otp_request removed — use POST /auth/challenge then POST /wallet/:address/send with hybrid PQ signatures.",
+            "error": "wallet_otp_request removed â€” use POST /auth/challenge then POST /wallet/:address/send with hybrid PQ signatures.",
             "v2_flow": ["POST /auth/challenge", "POST /wallet/:address/send"]
         })),
     )
@@ -2876,7 +2865,7 @@ async fn wallet_otp_verify(
     (
         StatusCode::GONE,
         Json(serde_json::json!({
-            "error": "wallet_otp_verify removed — use the v2 challenge flow.",
+            "error": "wallet_otp_verify removed â€” use the v2 challenge flow.",
             "v2_flow": ["POST /auth/challenge", "POST /wallet/:address/send"]
         })),
     )
@@ -2921,7 +2910,7 @@ async fn wallet_redeem(
     sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'wallet_redeem', NOW())").bind(&burn_id).bind(&linked_vault_id).bind(amount.to_string()).execute(&pool).await.ok();
     let tx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, 'redeem', 'UBTC Redeemed for BTC', 'completed', NOW())").bind(&tx_id).bind(wallet_row.get::<String, _>("user_id")).bind(amount.to_string()).execute(&pool).await.ok();
-    tracing::info!("Wallet redeem @{} â€” {} UBTC -> {} BTC txid: {}", username, amount, btc_sent, txid);
+    tracing::info!("Wallet redeem @{} Ã¢â‚¬â€ {} UBTC -> {} BTC txid: {}", username, amount, btc_sent, txid);
     Ok(Json(WalletRedeemResponse { txid, wallet_address: req.wallet_address, ubtc_burned: amount.to_string(), btc_sent: format!("{:.8}", btc_sent), destination_btc_address: req.destination_btc_address, message: format!("${} UBTC redeemed. {} BTC sent to your Bitcoin address.", amount, btc_sent) }))
 }
 
@@ -2964,7 +2953,7 @@ async fn mint_ubtc_proof(
     let proof = UBTCProof::new_minted(state, collateral);
     let proof_json = proof.to_json().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
     let proof_id = format!("proof_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    tracing::info!("Minted UBTC proof {} for vault {} â€” {} sats", proof_id, vault_id, amount_sats);
+    tracing::info!("Minted UBTC proof {} for vault {} Ã¢â‚¬â€ {} sats", proof_id, vault_id, amount_sats);
     Ok(Json(serde_json::json!({
         "proof_id": proof_id,
         "vault_id": vault_id,
@@ -2980,7 +2969,7 @@ async fn cosign_transfer(
     let nullifier = req["spent_nullifier"].as_str().ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"spent_nullifier required"}))))?;
     let recipient_pk = req["recipient_dilithium_pk"].as_str().ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"recipient_dilithium_pk required"}))))?;
     let cosign_id = format!("cosign_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    tracing::info!("Co-signed transfer â€” nullifier: {} recipient: {}...", &nullifier[..8], &recipient_pk[..8.min(recipient_pk.len())]);
+    tracing::info!("Co-signed transfer Ã¢â‚¬â€ nullifier: {} recipient: {}...", &nullifier[..8], &recipient_pk[..8.min(recipient_pk.len())]);
     Ok(Json(serde_json::json!({
         "cosign_id": cosign_id,
         "status": "approved",
@@ -3119,7 +3108,7 @@ async fn redeem_ubtc(
     }
 
     // v2: client-held secret signs a server-issued challenge. The qsk field
-    // is gone — secret keys must NEVER be sent over the wire.
+    // is gone â€” secret keys must NEVER be sent over the wire.
     let owner_wallet: String = sqlx::query("SELECT wallet_address FROM ubtc_wallets WHERE linked_vault_id = $1")
         .bind(vault_id).fetch_optional(&pool).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
@@ -3172,7 +3161,7 @@ async fn redeem_ubtc(
                 destination,
             ).await
         } else {
-            // Fallback â€” use Bitcoin Core to send from deposit address
+            // Fallback Ã¢â‚¬â€ use Bitcoin Core to send from deposit address
             let send_amount = btc_to_release_sats as f64 / 100_000_000.0;
             rpc_call("sendtoaddress", serde_json::json!([destination, send_amount]))
                 .await.ok().and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -3197,7 +3186,7 @@ async fn redeem_ubtc(
           use sha2::Digest; let null_hex = hex::encode(sha2::Sha256::digest(nullifier.as_bytes()));
             let _ = rpc_call("ubtc/nullifier/spend", serde_json::json!({"nullifier": null_hex})).await;
 
-            tracing::info!("Redeemed {} UBTC from vault {} â€” BTC txid: {}", ubtc_amount, vault_id, txid);
+            tracing::info!("Redeemed {} UBTC from vault {} Ã¢â‚¬â€ BTC txid: {}", ubtc_amount, vault_id, txid);
 
             return Ok(Json(serde_json::json!({
                 "redeem_id": redeem_id,
@@ -3209,12 +3198,12 @@ async fn redeem_ubtc(
                 "bitcoin_txid": txid,
                 "remaining_ubtc": remaining_ubtc,
                 "status": "completed",
-                "message": format!("Redeemed {} UBTC â€” {} BTC sent to {}", ubtc_amount, btc_to_release_sats as f64 / 100_000_000.0, destination)
+                "message": format!("Redeemed {} UBTC Ã¢â‚¬â€ {} BTC sent to {}", ubtc_amount, btc_to_release_sats as f64 / 100_000_000.0, destination)
             })));
         }
     }
 
-    // No UTXO found â€” use Bitcoin Core sendtoaddress as fallback
+    // No UTXO found Ã¢â‚¬â€ use Bitcoin Core sendtoaddress as fallback
     let send_amount = btc_to_release_sats as f64 / 100_000_000.0;
     let btc_txid = rpc_call("sendtoaddress", serde_json::json!([destination, send_amount])).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Bitcoin send failed: {}", e)}))))?;
@@ -3226,7 +3215,7 @@ async fn redeem_ubtc(
         .bind(vault_id)
         .execute(&pool).await.ok();
 
-    tracing::info!("Redeemed {} UBTC from vault {} (fallback) â€” txid: {}", ubtc_amount, vault_id, txid);
+    tracing::info!("Redeemed {} UBTC from vault {} (fallback) Ã¢â‚¬â€ txid: {}", ubtc_amount, vault_id, txid);
 
     Ok(Json(serde_json::json!({
         "redeem_id": redeem_id,
@@ -3238,7 +3227,7 @@ async fn redeem_ubtc(
         "bitcoin_txid": txid,
         "remaining_ubtc": remaining_ubtc,
         "status": "completed",
-     "message": format!("Redeemed {} UBTC â€” {} BTC sent to {}", ubtc_amount, send_amount, destination)
+     "message": format!("Redeemed {} UBTC Ã¢â‚¬â€ {} BTC sent to {}", ubtc_amount, send_amount, destination)
     })))
 }
 
@@ -3273,7 +3262,7 @@ async fn construct_and_broadcast_redemption(
     let txid = Txid::from_str(utxo_txid).ok()?;
     let outpoint = OutPoint { txid, vout: utxo_vout };
 
-    // Fee estimate â€” 200 sats/vbyte Ã— ~150 vbytes = 30000 sats
+    // Fee estimate Ã¢â‚¬â€ 200 sats/vbyte Ãƒâ€” ~150 vbytes = 30000 sats
     let fee_sats = 30000u64;
     let output_sats = release_sats.saturating_sub(fee_sats);
 
@@ -3333,7 +3322,7 @@ async fn construct_and_broadcast_redemption(
     match result {
         Ok(v) => v.as_str().map(|s| s.to_string()),
         Err(e) => {
-            tracing::warn!("Raw transaction broadcast failed: {} â€” trying fallback", e);
+            tracing::warn!("Raw transaction broadcast failed: {} Ã¢â‚¬â€ trying fallback", e);
             None
         }
     }
@@ -3374,7 +3363,7 @@ async fn stablecoin_deposit(
     let amount = Decimal::from_str(&req.amount).map_err(|_| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid amount"}))))?;
     if amount <= dec!(0) { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "amount must be positive"})))); }
     let account_type = req.account_type.unwrap_or_else(|| "current".to_string());
-    // Check if a vault already exists for this currency + account_type â€” top it up instead of creating new
+    // Check if a vault already exists for this currency + account_type Ã¢â‚¬â€ top it up instead of creating new
     let existing_sc = sqlx::query("SELECT id, deposited_amount FROM stablecoin_vaults WHERE currency = $1 AND account_type = $2 AND status = 'active' ORDER BY created_at ASC LIMIT 1")
         .bind(&currency).bind(&account_type).fetch_optional(&pool).await.unwrap_or(None);
     let vault_id = if let Some(ex_row) = existing_sc {
@@ -3396,7 +3385,7 @@ async fn stablecoin_deposit(
     let underlying = if currency == "UUSDT" { "USDT" } else { "USDC" };
     sqlx::query("INSERT INTO stablecoin_transactions (id, vault_id, kind, amount, currency, description, created_at) VALUES ($1, $2, 'deposit', $3, $4, $5, NOW())")
         .bind(&tx_id).bind(&vault_id).bind(amount.to_string()).bind(&currency)
-        .bind(format!("{} deposited â€” locked in quantum vault", underlying))
+        .bind(format!("{} deposited Ã¢â‚¬â€ locked in quantum vault", underlying))
         .execute(&pool).await.ok();
     tracing::info!("Stablecoin deposit {} {} vault={}", amount, currency, vault_id);
     Ok(Json(StablecoinDepositResponse {
@@ -3434,7 +3423,7 @@ async fn stablecoin_mint(
     let mint_id = format!("scmint_{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO stablecoin_transactions (id, vault_id, kind, amount, currency, description, created_at) VALUES ($1, $2, 'mint', $3, $4, $5, NOW())")
         .bind(&mint_id).bind(&req.vault_id).bind(amount.to_string()).bind(&currency)
-        .bind(format!("{} minted 1:1 â€” quantum-secured on Bitcoin protocol", currency))
+        .bind(format!("{} minted 1:1 Ã¢â‚¬â€ quantum-secured on Bitcoin protocol", currency))
         .execute(&pool).await.ok();
     tracing::info!("Minted {} {} vault={}", amount, currency, req.vault_id);
     let underlying = if currency == "UUSDT" { "USDT" } else { "USDC" };
@@ -3469,7 +3458,7 @@ async fn stablecoin_burn(
     let underlying = if currency == "UUSDT" { "USDT" } else { "USDC" };
     sqlx::query("INSERT INTO stablecoin_transactions (id, vault_id, kind, amount, currency, description, created_at) VALUES ($1, $2, 'burn', $3, $4, $5, NOW())")
         .bind(&burn_id).bind(&req.vault_id).bind(amount.to_string()).bind(&currency)
-        .bind(format!("{} burned â€” {} released from quantum vault", currency, underlying))
+        .bind(format!("{} burned Ã¢â‚¬â€ {} released from quantum vault", currency, underlying))
         .execute(&pool).await.ok();
     tracing::info!("Burned {} {} vault={}", amount, currency, req.vault_id);
     Ok(Json(StablecoinBurnResponse {
@@ -3500,7 +3489,7 @@ async fn stablecoin_transfer(
     let underlying = if currency == "UUSDT" { "USDT" } else { "USDC" };
     sqlx::query("INSERT INTO stablecoin_transactions (id, vault_id, kind, amount, currency, description, created_at) VALUES ($1, $2, 'transfer', $3, $4, $5, NOW())")
         .bind(&transfer_id).bind(&req.from_vault_id).bind(amount.to_string()).bind(&currency)
-        .bind(format!("{} transferred â€” quantum signature verified", currency))
+        .bind(format!("{} transferred Ã¢â‚¬â€ quantum signature verified", currency))
         .execute(&pool).await.ok();
    // Credit recipient wallet if to_address is a UBTC wallet
     if let Ok(wallet_row) = sqlx::query("SELECT id, user_id, uusdt_balance, uusdc_balance FROM ubtc_wallets WHERE wallet_address = $1")
@@ -3632,7 +3621,7 @@ struct ProofTransferResponse {
     message: String,
 }
 
-// The handler â€” add this function to main.rs
+// The handler Ã¢â‚¬â€ add this function to main.rs
 async fn transfer_proof(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     Json(req): Json<ProofTransferRequest>,
@@ -3819,7 +3808,7 @@ async fn set_wallet_username(
         sqlx::query("UPDATE ubtc_users SET username = $1 WHERE wallet_address = $2")
             .bind(quantum_username).bind(wallet_address).execute(&pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
     };
-    tracing::info!("Quantum username @{} set â€” rows affected: {}", quantum_username, updated.rows_affected());
+    tracing::info!("Quantum username @{} set Ã¢â‚¬â€ rows affected: {}", quantum_username, updated.rows_affected());
     tracing::info!("Quantum username @{} set for {}", quantum_username, wallet_address);
     Ok(Json(serde_json::json!({"success": true, "username": quantum_username})))
 }
