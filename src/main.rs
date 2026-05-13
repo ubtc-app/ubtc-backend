@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     routing::{get, post},
     Router, Json,
     http::StatusCode,
@@ -305,6 +305,58 @@ fn generate_wallet_address(public_key_b64: &str) -> String {
     format!("ubtc1{}", &hash[..32])
 }
 
+/// Legacy SHA-256 hash for backwards compatibility with rows that have no salt.
+/// New code MUST use hash_recovery_key_argon2id() instead.
+fn hash_recovery_key_legacy(key: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(b"ubtc-recovery-salt-2024");
+    hasher.update(key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Verifies a recovery key against a legacy SHA-256 hash. Used only when
+/// hash_algo = 'sha256_legacy'. Returns true if matched.
+fn verify_recovery_key_legacy(key: &str, stored_hash: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let computed = hash_recovery_key_legacy(key);
+    computed.as_bytes().ct_eq(stored_hash.as_bytes()).into()
+}
+
+/// Generates a new random 16-byte salt, hex-encoded.
+fn new_recovery_salt() -> String {
+    use rand::RngCore;
+    let mut salt_bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt_bytes);
+    hex::encode(salt_bytes)
+}
+
+/// Argon2id hash of a recovery key with per-row salt.
+/// Returns the PHC-formatted hash string for storage.
+fn hash_recovery_key_argon2id(key: &str, salt_hex: &str) -> Result<String, String> {
+    use argon2::{Argon2, PasswordHasher};
+    use argon2::password_hash::SaltString;
+    let salt_bytes = hex::decode(salt_hex).map_err(|e| format!("bad salt hex: {}", e))?;
+    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| format!("salt encode: {}", e))?;
+    let argon2 = Argon2::default();
+    argon2.hash_password(key.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| format!("argon2 hash: {}", e))
+}
+
+/// Verifies a recovery key against a stored Argon2id PHC hash.
+fn verify_recovery_key_argon2id(key: &str, stored_hash: &str) -> bool {
+    use argon2::{Argon2, PasswordVerifier};
+    use argon2::password_hash::PasswordHash;
+    let parsed = match PasswordHash::new(stored_hash) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    Argon2::default().verify_password(key.as_bytes(), &parsed).is_ok()
+}
+
+/// Compatibility shim: kept for any call sites that still use the old name.
+/// New code should call hash_recovery_key_argon2id directly with a salt.
 fn hash_recovery_key(key: &str) -> String {
     use sha2::{Sha256, Digest};
     let mut hasher = Sha256::new();
@@ -971,7 +1023,21 @@ async fn vault_to_wallet(
             hex::encode(hasher.finalize()) == stored_hash
         } else { false }
     } else {
-        second_key == std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default()
+        // SECURITY: legacy env-var fallback. Disabled by default.
+        // Set LEGACY_PSK_FALLBACK=true ONLY to allow vaults missing a
+        // protocol_key_hash to authorize via the global env-var PSK.
+        // Every hit is logged so legacy vaults can be migrated and the flag
+        // removed.
+        let allow_legacy = std::env::var("LEGACY_PSK_FALLBACK").unwrap_or_default() == "true";
+        if !allow_legacy {
+            tracing::error!(target: "psk_audit", "rejected: vault has no protocol_key_hash and LEGACY_PSK_FALLBACK is not enabled");
+            false
+        } else {
+            let env_key = std::env::var("PROTOCOL_SECRET_KEY").unwrap_or_default();
+            let ok = !env_key.is_empty() && second_key == env_key;
+            tracing::warn!(target: "psk_audit", "LEGACY_PSK_FALLBACK used. matched={}. Migrate this vault to a per-vault hash.", ok);
+            ok
+        }
     };
     if !key_valid {
         return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"Invalid Protocol Second Key"}))));
@@ -1023,6 +1089,13 @@ async fn vault_to_wallet(
     sqlx::query("INSERT INTO wallet_transactions (id, from_vault_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'from_vault', 'Received from vault', 'completed', NOW())")
         .bind(&tx_id).bind(&req.vault_id).bind(&wallet_user_id).bind(amount.to_string())
         .execute(&pool).await.ok();
+    // Stage 1: track which vault backs this chunk of the wallet's balance (FIFO ledger)
+    let hold_id = format!("hold_{}", &Uuid::new_v4().to_string()[..12]);
+   sqlx::query("INSERT INTO wallet_holdings (id, wallet_address, vault_id, ubtc_amount, source_type, source_ref, created_at) VALUES ($1, $2, $3, $4::numeric, 'vault_to_wallet', $5, NOW())")
+        .bind(&hold_id).bind(&req.wallet_address).bind(&req.vault_id).bind(amount.to_string()).bind(&tx_id)
+        .execute(&pool).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("holdings insert failed: {}", e)}))))?;
+    tracing::info!("wallet_holdings: +{} UBTC to {} from vault {}", amount, req.wallet_address, req.vault_id);
 
     // Ã¢â€â‚¬Ã¢â€â‚¬ PROOF FILE GENERATION Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     // Generate a Kyber-encrypted CSV proof file for the recipient wallet.
@@ -1473,7 +1546,7 @@ async fn transfer_ubtc(
     sqlx::query("INSERT INTO ubtc_transfers (id, from_vault_id, to_address, ubtc_amount, taproot_placeholder, status, created_at) VALUES ($1, $2, $3, $4, true, 'completed', NOW())").bind(&transfer_id).bind(&vault_id).bind(&req.to_address).bind(amount.to_string()).execute(&pool).await.ok();
     let burn_id = format!("burn_{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO burns (id, vault_id, ubtc_burned, kind, created_at) VALUES ($1, $2, $3, 'transfer', NOW())").bind(&burn_id).bind(&vault_id).bind(amount.to_string()).execute(&pool).await.ok();
-    // Credit recipient wallet if to_address is a UBTC wallet
+   // Credit recipient wallet if to_address is a UBTC wallet
     if let Ok(wallet_row) = sqlx::query("SELECT id, balance, user_id FROM ubtc_wallets WHERE wallet_address = $1")
         .bind(&req.to_address).fetch_one(&pool).await {
         let wallet_id: String = wallet_row.get("id");
@@ -1485,6 +1558,12 @@ async fn transfer_ubtc(
         let wtx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
         sqlx::query("INSERT INTO wallet_transactions (id, from_vault_id, to_user_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, 'received', 'UBTC received from transfer', 'completed', NOW())")
             .bind(&wtx_id).bind(&vault_id).bind(&to_user_id).bind(amount.to_string()).execute(&pool).await.ok();
+        // Stage 1: track which vault backs this chunk of the wallet's balance (FIFO ledger)
+        let hold_id = format!("hold_{}", &Uuid::new_v4().to_string()[..12]);
+sqlx::query("INSERT INTO wallet_holdings (id, wallet_address, vault_id, ubtc_amount, source_type, source_ref, created_at) VALUES ($1, $2, $3, $4::numeric, 'vault_transfer', $5, NOW())")
+            .bind(&hold_id).bind(&req.to_address).bind(&vault_id).bind(amount.to_string()).bind(&wtx_id)
+            .execute(&pool).await.ok();
+        tracing::info!("wallet_holdings: +{} UBTC to {} from vault {} (transfer)", amount, req.to_address, vault_id);
   } // end credit wallet
 
     // Transfer the 1-sat UTXO anchor on Bitcoin
@@ -1928,6 +2007,14 @@ async fn redeem_proof(
     
     }
 
+    // Also check: proof must not have been transferred onward
+    let transferred = sqlx::query(
+        "SELECT transferred_to FROM ubtc_proofs WHERE proof_id = $1 AND transferred_to IS NOT NULL"
+    ).bind(proof_id).fetch_optional(&pool).await.unwrap_or(None);
+    if transferred.is_some() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "This proof has been transferred onward and can no longer be redeemed by the original holder"}))));
+    }
+
     // Also check nullifier table
     let nullifier_spent = sqlx::query(
         "SELECT id FROM nullifiers WHERE nullifier_hex = $1"
@@ -2162,7 +2249,7 @@ async fn get_wallet_proofs(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT id, proof_id, sender_vault_id, proof_data, downloaded, created_at FROM ubtc_proofs WHERE recipient_wallet_address = $1 AND downloaded = false ORDER BY created_at DESC"
+       "SELECT id, proof_id, sender_vault_id, proof_data, downloaded, downloaded_at, created_at FROM ubtc_proofs WHERE recipient_wallet_address = $1 AND redeemed = false AND transferred_to IS NULL ORDER BY created_at DESC"
     ).bind(&wallet_address).fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let proofs: Vec<serde_json::Value> = rows.iter().map(|row| {
         serde_json::json!({
@@ -2170,7 +2257,8 @@ async fn get_wallet_proofs(
             "proof_id": row.get::<String, _>("proof_id"),
             "sender_vault_id": row.get::<String, _>("sender_vault_id"),
             "proof_data": row.get::<serde_json::Value, _>("proof_data"),
-            "downloaded": row.get::<bool, _>("downloaded"),
+           "downloaded": row.get::<bool, _>("downloaded"),
+            "downloaded_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("downloaded_at").map(|d| d.to_rfc3339()),
             "created_at": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
         })
     }).collect();
@@ -2189,8 +2277,8 @@ async fn download_proof(
     let proof_data: serde_json::Value = row.get("proof_data");
     sqlx::query("UPDATE ubtc_proofs SET downloaded = true, downloaded_at = NOW() WHERE proof_id = $1")
         .bind(&proof_id).execute(&pool).await.ok();
-    tracing::info!("Proof {} downloaded and marked for deletion", proof_id);
-    Ok(Json(serde_json::json!({ "proof": proof_data, "message": "Proof downloaded. Server copy marked for deletion." })))
+  tracing::info!("Proof {} downloaded (server copy retained until redeemed)", proof_id);
+ Ok(Json(serde_json::json!({ "proof": proof_data, "message": "Proof downloaded. You can re-download until redeemed." })))
 }
 fn derive_anchor_address_for_wallet(wallet_address: &str) -> String {
     use bitcoin::{secp256k1::{Secp256k1, SecretKey}, Address, Network as BtcNetwork};
@@ -2507,6 +2595,120 @@ async fn lookup_user(
         None => Ok(Json(UserLookupResponse { user_id: String::new(), username, wallet_address: String::new(), found: false }))
     }
 }
+// Stage 2 helper: generate ONE proof for ONE chunk of UBTC from ONE backing vault.
+// Inserts into ubtc_proofs. Returns Ok(proof_id) on success.
+// All Kyber encryption + nullifier hashing lives here so the FIFO loop stays small.
+async fn generate_proof_for_chunk(
+    pool: &sqlx::PgPool,
+    sender_address: &str,
+    recipient_wallet_address: &str,
+    recipient_user_id: &str,
+    backing_vault_id: &str,
+    chunk_amount: rust_decimal::Decimal,
+    tx_id: &str,
+) -> Result<String, String> {
+    use sqlx::Row;
+    use sha2::{Sha256, Digest};
+
+    // Vault data
+    let vault_row = sqlx::query(
+        "SELECT deposit_address, mast_address, taproot_secret_key, btc_amount_sats FROM vaults WHERE id = $1"
+    ).bind(backing_vault_id).fetch_one(pool).await
+        .map_err(|e| format!("vault lookup failed: {}", e))?;
+    let deposit_address: String = vault_row.get("deposit_address");
+    let mast_address: Option<String> = vault_row.try_get("mast_address").unwrap_or(None);
+    let taproot_secret_key: Option<String> = vault_row.try_get("taproot_secret_key").unwrap_or(None);
+    let btc_amount_sats: i64 = vault_row.get("btc_amount_sats");
+
+    // Recipient dilithium pk
+    let recipient_row = sqlx::query(
+        "SELECT public_key FROM ubtc_wallets WHERE wallet_address = (SELECT wallet_address FROM ubtc_users WHERE id = $1)"
+    ).bind(recipient_user_id).fetch_one(pool).await
+        .map_err(|e| format!("recipient lookup failed: {}", e))?;
+    let recipient_pk: String = recipient_row.get("public_key");
+
+    // Proof id + nullifier hash (unique per chunk)
+    let proof_id = format!("prf_{}", &Uuid::new_v4().to_string()[..12]);
+    let nullifier_preimage = format!("{}:{}:{}", proof_id, recipient_pk, tx_id);
+    let mut hasher = Sha256::new();
+    hasher.update(nullifier_preimage.as_bytes());
+    let nullifier_hash = hex::encode(hasher.finalize());
+
+    // Kyber encrypt taproot key for recipient
+    let raw_taproot = taproot_secret_key.clone().unwrap_or_default();
+    let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets WHERE wallet_address = $1")
+        .bind(recipient_wallet_address).fetch_optional(pool).await.ok().flatten()
+        .and_then(|r| r.try_get::<String, _>("kyber_pk").ok()).unwrap_or_default();
+    let (wallet_taproot_encrypted, wallet_encryption) = if !recipient_kyber_pk.is_empty() && !raw_taproot.is_empty() {
+        match kyber_encrypt_for_recipient(raw_taproot.as_bytes(), &recipient_kyber_pk) {
+            Ok(enc) => { tracing::info!("chunk proof: Kyber1024 encryption SUCCESS for vault {}", backing_vault_id); (enc, "kyber1024") },
+            Err(e) => { tracing::error!("chunk proof: Kyber1024 FAILED: {}", e); (raw_taproot.clone(), "none") },
+        }
+    } else {
+        tracing::warn!("chunk proof: Kyber skipped: kyber_pk_empty={} taproot_empty={}", recipient_kyber_pk.is_empty(), raw_taproot.is_empty());
+        (raw_taproot.clone(), "none")
+    };
+
+    let btc_release_sats = (chunk_amount.to_string().parse::<f64>().unwrap_or(0.0) / 100.0 * 0.015 * 100_000_000.0) as i64;
+
+    let proof_data = serde_json::json!({
+        "version": "UBTCV1",
+        "proof_id": proof_id,
+        "created_at": chrono::Utc::now().timestamp(),
+        "expires_at": chrono::Utc::now().timestamp() + 31_536_000,
+        "collateral": {
+            "vault_id": backing_vault_id,
+            "vault_address": mast_address.unwrap_or(deposit_address),
+            "vault_utxo_amount_sats": btc_amount_sats,
+        },
+        "ownership": {
+            "ubtc_amount": chunk_amount.to_string(),
+            "btc_release_sats": btc_release_sats,
+            "owner_dilithium_pk": recipient_pk,
+            "wallet_address": recipient_wallet_address,
+        },
+        "nullifier": {
+            "hash": nullifier_hash,
+            "bitcoin_prefix": "QUANTUM:",
+            "redeemed": false,
+            "redemption_txid": null
+        },
+        "redemption_template": {
+            "type": "kyber_encrypted",
+            "note": "Decrypt with KEY 3 (Kyber) to get taproot_secret_key for Bitcoin redemption",
+            "taproot_secret_key_encrypted": wallet_taproot_encrypted,
+            "encryption": wallet_encryption,
+            "signing_path": "key_path",
+            "rbf_enabled": true,
+            "fee_note": "Calculate fee at redemption time"
+        },
+        "ownership_chain": [{
+            "step": 0,
+            "type": "wallet_transfer",
+            "from": sender_address,
+            "to": recipient_wallet_address,
+            "amount": chunk_amount.to_string(),
+            "timestamp": chrono::Utc::now().timestamp()
+        }],
+        "broadcast_endpoints": [
+            "https://mempool.space/testnet4/api/tx",
+            "https://blockstream.info/testnet/api/tx",
+            "manual"
+        ],
+        "integrity": { "proof_hash": nullifier_hash }
+    });
+
+    let proof_db_id = format!("proof_{}", &Uuid::new_v4().to_string()[..8]);
+    sqlx::query(
+        "INSERT INTO ubtc_proofs (id, proof_id, sender_vault_id, recipient_wallet_address, proof_data, downloaded, created_at) VALUES ($1, $2, $3, $4, $5, false, NOW())"
+    )
+        .bind(&proof_db_id).bind(&proof_id).bind(backing_vault_id)
+        .bind(recipient_wallet_address).bind(&proof_data)
+        .execute(pool).await
+        .map_err(|e| format!("proof insert failed: {}", e))?;
+
+    Ok(proof_id)
+}
 
 async fn send_from_wallet(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
@@ -2571,18 +2773,83 @@ async fn send_from_wallet(
             .and_then(|r| r.try_get::<String, _>("from_vault_id").ok())
             .unwrap_or(linked_vault_id.clone());
         sqlx::query("INSERT INTO wallet_transactions (id, from_user_id, to_user_id, from_vault_id, amount, transaction_type, description, status, created_at) VALUES ($1, $2, $3, $4, $5, 'internal', 'Internal UBTC transfer', 'completed', NOW())").bind(&tx_id).bind(sender.get::<String, _>("user_id")).bind(&recipient_user_id).bind(&tx_vault_id).bind(amount.to_string()).execute(&pool).await.ok();
-        // Generate proof file for recipient Ã¢â‚¬â€ find backing vault from sender's linked vault or transaction history
-      // Only generate proof for wallet-to-wallet transfers (not vault-to-wallet which generates its own proof)
-       let is_self_transfer = req.to_username_or_address == req.from_address;
-        // Always trace back to the original collateral vault Ã¢â‚¬â€ never use sender's own linked vault
-        // because the sender may not have BTC in their vault (they received UBTC from someone else)
-        let backing_vault_id = if is_self_transfer { String::new() } else {
+      // Stage 2: FIFO multi-vault proof generation.
+        // Instead of guessing a "backing vault" from transaction history, walk the
+        // sender's wallet_holdings ledger in time order and generate one proof per
+        // chunk consumed. This makes multi-vault sends correct end-to-end.
+        let is_self_transfer = req.to_username_or_address == req.from_address;
+        let mut generated_proof_ids: Vec<String> = Vec::new();
+
+        if !is_self_transfer {
+            // Read sender's holdings oldest first
+            let holdings = sqlx::query("SELECT id, vault_id, ubtc_amount::text as ubtc_amount FROM wallet_holdings WHERE wallet_address = $1 ORDER BY created_at ASC")
+                .bind(&req.from_address).fetch_all(&pool).await.unwrap_or_default();
+
+            let mut remaining = amount;
+            for h in &holdings {
+                if remaining <= dec!(0) { break; }
+                let h_id: String = h.get("id");
+                let h_vault: String = h.get("vault_id");
+                let h_amt_str: String = h.get("ubtc_amount");
+                let h_amt = Decimal::from_str(&h_amt_str).unwrap_or(dec!(0));
+                if h_amt <= dec!(0) { continue; }
+
+                let take = if h_amt <= remaining { h_amt } else { remaining };
+
+                // Generate proof for this chunk
+                match generate_proof_for_chunk(
+                    &pool,
+                    &req.from_address,
+                    &req.to_username_or_address,
+                    &recipient_user_id,
+                    &h_vault,
+                    take,
+                    &tx_id,
+                ).await {
+                    Ok(pid) => {
+                        tracing::info!("chunk proof generated: {} for {} UBTC from vault {}", pid, take, h_vault);
+                        generated_proof_ids.push(pid);
+                    },
+                    Err(e) => {
+                        tracing::error!("chunk proof FAILED for vault {}: {}", h_vault, e);
+                    }
+                }
+
+                // Insert recipient holdings row for this chunk
+                let recip_hold_id = format!("hold_{}", &Uuid::new_v4().to_string()[..12]);
+                sqlx::query("INSERT INTO wallet_holdings (id, wallet_address, vault_id, ubtc_amount, source_type, source_ref, created_at) VALUES ($1, $2, $3, $4::numeric, 'wallet_transfer', $5, NOW())")
+                    .bind(&recip_hold_id).bind(&req.to_username_or_address).bind(&h_vault).bind(take.to_string()).bind(&tx_id)
+                    .execute(&pool).await.ok();
+                tracing::info!("wallet_holdings: +{} UBTC to {} from vault {}", take, req.to_username_or_address, h_vault);
+
+                // Decrement or delete sender's holdings row
+                if h_amt - take <= dec!(0) {
+                    sqlx::query("DELETE FROM wallet_holdings WHERE id = $1")
+                        .bind(&h_id).execute(&pool).await.ok();
+                } else {
+                    let new_h_amt = h_amt - take;
+                    sqlx::query("UPDATE wallet_holdings SET ubtc_amount = $1::numeric WHERE id = $2")
+                        .bind(new_h_amt.to_string()).bind(&h_id).execute(&pool).await.ok();
+                }
+
+                remaining -= take;
+            }
+
+            if remaining > dec!(0) {
+                tracing::warn!("Stage 2: insufficient holdings to cover full send amount. Remaining unallocated: {}", remaining);
+            }
+        }
+
+        // The old single-vault proof-generation block follows for backwards compat
+        // (only runs if NO holdings produced any proofs, e.g. legacy wallets with no holdings rows yet).
+        let backing_vault_id = if is_self_transfer || !generated_proof_ids.is_empty() {
+            String::new()
+        } else {
             sqlx::query("SELECT from_vault_id FROM wallet_transactions WHERE to_user_id = $1 AND from_vault_id IS NOT NULL ORDER BY created_at DESC LIMIT 1")
                 .bind(sender.get::<String, _>("user_id")).fetch_optional(&pool).await.unwrap_or(None)
                 .and_then(|r| r.try_get::<String, _>("from_vault_id").ok())
                 .unwrap_or(linked_vault_id.clone())
         };
-
         if !backing_vault_id.is_empty() {
             if let Ok(vault_row) = sqlx::query(
                 "SELECT deposit_address, mast_address, taproot_secret_key, btc_amount_sats FROM vaults WHERE id = $1"
@@ -2690,11 +2957,20 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                  if req.from_address != recipient_wallet_address {
                        tracing::info!("Proof generated for wallet transfer: {} -> {}", req.from_address, recipient_wallet_address);
                     // Invalidate sender's existing proofs Ã¢â‚¬â€ they've now transferred their UBTC
-                    sqlx::query("UPDATE ubtc_proofs SET transferred_to = $1, transferred_at = NOW(), downloaded = true WHERE recipient_wallet_address = $2 AND redeemed = false AND transferred_to IS NULL AND proof_id != $3")
+                   sqlx::query("UPDATE ubtc_proofs SET transferred_to = $1, transferred_at = NOW(), redeemed = true, downloaded = true WHERE recipient_wallet_address = $2 AND redeemed = false AND transferred_to IS NULL AND proof_id != $3")
                         .bind(&recipient_wallet_address)
                         .bind(&req.from_address)
                         .bind(&proof_id)
                         .execute(&pool).await.ok();
+                    // Insert nullifiers for every transferred proof so they can't be redeemed off-chain either
+                    let old_proof_ids: Vec<String> = sqlx::query_scalar("SELECT proof_id FROM ubtc_proofs WHERE recipient_wallet_address = $1 AND transferred_to = $2 AND proof_id != $3")
+                        .bind(&req.from_address).bind(&recipient_wallet_address).bind(&proof_id)
+                        .fetch_all(&pool).await.unwrap_or_default();
+                    for old_pid in old_proof_ids {
+                        sqlx::query("INSERT INTO nullifiers (id, nullifier_hex, spent_at) VALUES ($1, $2, NOW()) ON CONFLICT (nullifier_hex) DO NOTHING")
+                            .bind(format!("null_{}", &Uuid::new_v4().to_string()[..8])).bind(&old_pid)
+                            .execute(&pool).await.ok();
+                    }
                     } else {
                         tracing::info!("Skipping proof generation Ã¢â‚¬â€ same wallet transfer");
                         sqlx::query("DELETE FROM ubtc_proofs WHERE proof_id = $1")
@@ -3681,12 +3957,16 @@ async fn transfer_proof(
     // 5. Mark the old proof as transferred (burned for re-use)
     // We update the nullifier to redeemed=true so it can never be double-spent
     sqlx::query(
-        "UPDATE ubtc_proofs SET downloaded = true, transferred_to = $1, transferred_at = NOW() WHERE proof_id = $2"
+       "UPDATE ubtc_proofs SET downloaded = true, redeemed = true, transferred_to = $1, transferred_at = NOW() WHERE proof_id = $2"
     )
         .bind(&req.recipient_wallet)
         .bind(&req.old_proof_id)
         .execute(&pool).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    // Insert nullifier so the old proof can't be redeemed
+    sqlx::query("INSERT INTO nullifiers (id, nullifier_hex, spent_at) VALUES ($1, $2, NOW()) ON CONFLICT (nullifier_hex) DO NOTHING")
+        .bind(format!("null_{}", &Uuid::new_v4().to_string()[..8])).bind(&req.old_proof_id)
+        .execute(&pool).await.ok();
 
     // 6. Store the new proof for the recipient
     // NOTE: The new proof's taproot key is already re-encrypted client-side
@@ -3766,16 +4046,16 @@ async fn get_vault_redemptions(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT proof_id, (proof_data->'ownership'->>'ubtc_amount') as ubtc_amount, (proof_data->>'btc_price_at_redemption') as btc_price, (proof_data->>'btc_released_sats') as sats_released, redeemed_at FROM ubtc_proofs WHERE sender_vault_id = $1 AND redeemed = true ORDER BY redeemed_at DESC"
+        "SELECT proof_id, (proof_data->'ownership'->>'ubtc_amount') as ubtc_amount, (proof_data->>'btc_price_at_redemption') as btc_price, (proof_data->>'btc_released_sats') as sats_released, redeemed_at FROM ubtc_proofs WHERE sender_vault_id = $1 AND redeemed = true AND redeemed_at IS NOT NULL AND transferred_to IS NULL ORDER BY redeemed_at DESC"
     ).bind(&vault_id).fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let redemptions: Vec<serde_json::Value> = rows.iter().map(|r| {
-        let redeemed_at: chrono::DateTime<chrono::Utc> = r.get("redeemed_at");
+        let redeemed_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("redeemed_at").ok();
         serde_json::json!({
             "proof_id": r.get::<String,_>("proof_id"),
             "ubtc_amount": r.try_get::<String,_>("ubtc_amount").unwrap_or_default(),
             "btc_price": r.try_get::<String,_>("btc_price").unwrap_or_default(),
             "sats_released": r.try_get::<String,_>("sats_released").unwrap_or_default(),
-            "redeemed_at": redeemed_at.to_rfc3339(),
+            "redeemed_at": redeemed_at.map(|d| d.to_rfc3339()),
         })
     }).collect();
     Ok(Json(serde_json::json!({ "redemptions": redemptions })))
