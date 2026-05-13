@@ -1,3 +1,10 @@
 /target
 .env
 *.log
+
+# Backup files
+*.bak
+*.backup
+*.stage1-backup
+*.stage2-backup
+build-log.txt
