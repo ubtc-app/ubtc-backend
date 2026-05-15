@@ -2655,12 +2655,48 @@ async fn telegram_auth(
             telegram_id,
             telegram_handle,
             telegram_first_name,
-        }))
+       }))
     }
 }
-
-
-
+/// Best-effort Telegram notification. Fire and forget — never affects callers.
+async fn send_telegram_message(telegram_id: i64, text: String, web_app_url: Option<String>) {
+    let bot_token = match std::env::var("TELEGRAM_BOT_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            tracing::warn!("send_telegram_message: TELEGRAM_BOT_TOKEN not set, skipping");
+            return;
+        }
+    };
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+    let mut body = serde_json::json!({
+        "chat_id": telegram_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": true,
+    });
+    if let Some(app_url) = web_app_url {
+        body["reply_markup"] = serde_json::json!({
+            "inline_keyboard": [[
+                { "text": "Open Wallet", "web_app": { "url": app_url } }
+            ]]
+        });
+    }
+    let client = reqwest::Client::new();
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                tracing::info!("send_telegram_message: ok to telegram_id={}", telegram_id);
+            } else {
+                let resp_body = resp.text().await.unwrap_or_default();
+                tracing::warn!("send_telegram_message: telegram_id={} status={} body={}", telegram_id, status, resp_body);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("send_telegram_message: telegram_id={} error: {}", telegram_id, e);
+        }
+    }
+}
 async fn create_wallet(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     Json(req): Json<CreateWalletRequest>,
@@ -3231,7 +3267,46 @@ let recipient_kyber_pk: String = sqlx::query("SELECT kyber_pk FROM ubtc_wallets 
                  if quantum_txid.is_none() {
                      tracing::error!("[FAIL] QUANTUM:TRANSFER did NOT reach Bitcoin testnet4 - see error(s) above. Transfer recorded off-chain only.");
                  }
-return Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. Proof file generated for recipient.".to_string(), bitcoin_txid: quantum_txid }));
+// Best-effort Telegram notification for the recipient.
+            // Fire-and-forget — must not block or affect the transfer.
+            let recipient_user_id_for_notify = recipient_user_id.clone();
+            let sender_from_address_for_notify = req.from_address.clone();
+            let amount_for_notify = amount.to_string();
+            let pool_for_notify = pool.clone();
+            tokio::spawn(async move {
+                // Look up recipient's wallet_address and telegram_id from their user row
+                let recipient_row = sqlx::query("SELECT wallet_address, telegram_id FROM ubtc_users WHERE id = $1")
+                    .bind(&recipient_user_id_for_notify)
+                    .fetch_optional(&pool_for_notify).await.ok().flatten();
+                let recipient_row = match recipient_row { Some(r) => r, None => return };
+                let tg_id: Option<i64> = recipient_row.try_get::<Option<i64>, _>("telegram_id").ok().flatten();
+                let tg_id = match tg_id { Some(id) => id, None => return };
+                let recipient_wallet_address_for_notify: String = recipient_row.try_get::<String, _>("wallet_address").unwrap_or_default();
+                // Look up sender's telegram_handle (optional)
+                let sender_handle: Option<String> = sqlx::query("SELECT telegram_handle FROM ubtc_users WHERE wallet_address = $1")
+                    .bind(&sender_from_address_for_notify)
+                    .fetch_optional(&pool_for_notify).await.ok().flatten()
+                    .and_then(|r| r.try_get::<Option<String>, _>("telegram_handle").ok().flatten());
+                // Count proofs generated for this recipient in the last 30 seconds
+                let proof_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ubtc_proofs WHERE recipient_wallet_address = $1 AND created_at > NOW() - INTERVAL '30 seconds'")
+                    .bind(&recipient_wallet_address_for_notify)
+                    .fetch_one(&pool_for_notify).await.unwrap_or(0);
+                // Build the message
+                let mut text = format!("💰 You received {} UBTC", amount_for_notify);
+                if let Some(handle) = sender_handle {
+                    if !handle.is_empty() {
+                        text.push_str(&format!("\nFrom: @{}", handle));
+                    }
+                }
+                if proof_count > 1 {
+                    text.push_str(&format!("\n\nYou have {} proofs ready to redeem.", proof_count));
+                }
+                text.push_str("\nTap to open your wallet.");
+                let app_url = std::env::var("TELEGRAM_MINI_APP_URL")
+                    .unwrap_or_else(|_| "https://ubtc-frontend-coral.vercel.app/wallet".to_string());
+                send_telegram_message(tg_id, text, Some(app_url)).await;
+            });
+            return Ok(Json(SendFromWalletResponse { transaction_id: tx_id, from_address: req.from_address, to: recipient_username, amount: amount.to_string(), send_type: "internal".to_string(), message: "UBTC sent internally. Proof file generated for recipient.".to_string(), bitcoin_txid: quantum_txid }));
     } else {
         if linked_vault_id.is_empty() { return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No linked vault. External sends require a vault-linked wallet."})))); }
         let vault_row = sqlx::query("SELECT ubtc_minted, btc_amount_sats, status FROM vaults WHERE id = $1").bind(&linked_vault_id).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"linked vault not found"}))))?;
