@@ -381,6 +381,8 @@ fn hash_recovery_key(key: &str) -> String {
     account_type: Option<String>,
     username: Option<String>,
     wallet_name: Option<String>,
+    telegram_id: Option<i64>,
+    telegram_handle: Option<String>,
 }
 
 // CreateVaultResponse â€” server returns NO secret keys, ever.
@@ -432,6 +434,8 @@ fn hash_recovery_key(key: &str) -> String {
     kyber_pk: String,                     // ML-KEM-1024 PK, hex
     linked_vault_id: Option<String>,
     wallet_name: Option<String>,
+    telegram_id: Option<i64>,
+    telegram_handle: Option<String>,
 }
 #[derive(Serialize)] struct CreateWalletResponse {
     user_id: String,
@@ -598,7 +602,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/recovery/cancel", post(recovery_cancel))
         .route("/recovery/execute", post(recovery_execute))
         .route("/alerts/setup", post(setup_alert))
-        .route("/wallet/create", post(create_wallet))
+      .route("/wallet/create", post(create_wallet))
+        .route("/telegram/auth", post(telegram_auth))
         .route("/wallet/lookup/:username", get(lookup_user))
         .route("/wallet/otp/request", post(wallet_otp_request))
         .route("/wallet/otp/verify", post(wallet_otp_verify))
@@ -875,9 +880,20 @@ async fn create_vault(
         .bind(&unique_email)
         .bind(&wallet_address)
         .execute(&pool).await {
-            Ok(_) => tracing::info!("Created user record {}", user_id),
+          Ok(_) => tracing::info!("Created user record {}", user_id),
             Err(e) => tracing::error!("Failed to create user record: {}", e),
         }
+    // Link Telegram identity if provided
+    if let Some(tg_id) = req.telegram_id {
+        match sqlx::query("UPDATE ubtc_users SET telegram_id = $1, telegram_handle = $2 WHERE id = $3")
+            .bind(tg_id)
+            .bind(&req.telegram_handle)
+            .bind(&user_id)
+            .execute(&pool).await {
+                Ok(_) => tracing::info!("Linked telegram_id={} handle={:?} to user {}", tg_id, req.telegram_handle, user_id),
+                Err(e) => tracing::error!("Failed to link telegram identity: {}", e),
+            }
+    }
     match sqlx::query(
        "INSERT INTO ubtc_wallets (id, user_id, wallet_name, wallet_address, public_key, sphincs_pk, kyber_pk, balance, linked_vault_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, '0', $8, NOW())"
     )
@@ -2416,9 +2432,18 @@ async fn withdraw_verify(
 
 async fn dashboard(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<DashboardResponse>, StatusCode> {
     use sqlx::Row;
-    let rows = sqlx::query("SELECT id, status, deposit_address, btc_amount_sats, ubtc_minted, confirmations, account_type FROM vaults ORDER BY created_at DESC").fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let user_pubkey = params.get("user_pubkey").cloned().unwrap_or_default();
+    let rows = if user_pubkey.is_empty() {
+        // No identifier provided — return nothing rather than everyone's vaults.
+        Vec::new()
+    } else {
+        sqlx::query("SELECT id, status, deposit_address, btc_amount_sats, ubtc_minted, confirmations, account_type FROM vaults WHERE user_pubkey = $1 ORDER BY created_at DESC")
+            .bind(&user_pubkey)
+            .fetch_all(&pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
  let vaults: Vec<VaultStatus> = rows.iter().map(|row| VaultStatus { vault_id: row.get("id"), status: row.get("status"), deposit_address: row.get("deposit_address"), btc_amount_sats: row.get("btc_amount_sats"), ubtc_minted: row.get("ubtc_minted"), confirmations: row.get("confirmations"), account_type: row.get("account_type"), mast_address: row.try_get("mast_address").unwrap_or(None), network: row.try_get("network").unwrap_or_else(|_| "testnet4".to_string()), linked_wallet: None }).collect();
     let active_vaults = vaults.iter().filter(|v| v.status == "active").count() as i64;
     let total_btc_sats: i64 = vaults.iter().map(|v| v.btc_amount_sats).sum();
@@ -2509,6 +2534,132 @@ async fn recovery_execute(
     sqlx::query("UPDATE recovery_requests SET status = 'executed', executed_at = NOW(), txid = $1 WHERE id = $2").bind(&txid).bind(&req.request_id).execute(&pool).await.ok();
     Ok(Json(RecoveryExecuteResponse { request_id: req.request_id, vault_id, txid, ubtc_burned: to_burn.to_string(), btc_sent: format!("{:.8}", btc_sent), message: "Recovery executed.".to_string() }))
 }
+#[derive(Deserialize)]
+struct TelegramAuthRequest {
+    init_data: String,
+}
+
+#[derive(Serialize)]
+struct TelegramAuthResponse {
+    linked: bool,
+    wallet_address: Option<String>,
+    username: Option<String>,
+    telegram_id: i64,
+    telegram_handle: Option<String>,
+    telegram_first_name: Option<String>,
+}
+
+async fn telegram_auth(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    Json(req): Json<TelegramAuthRequest>,
+) -> Result<Json<TelegramAuthResponse>, (StatusCode, Json<serde_json::Value>)> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "telegram not configured"}))))?;
+
+    // Parse init_data as URL-encoded pairs
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(req.init_data.as_bytes())
+        .into_owned()
+        .collect();
+
+    let mut hash: Option<String> = None;
+    let mut auth_date: Option<i64> = None;
+    let mut user_json: Option<String> = None;
+    let mut data_pairs: Vec<(String, String)> = Vec::new();
+
+    for (k, v) in pairs {
+        if k == "hash" {
+            hash = Some(v);
+        } else {
+            if k == "auth_date" {
+                auth_date = v.parse::<i64>().ok();
+            }
+            if k == "user" {
+                user_json = Some(v.clone());
+            }
+            data_pairs.push((k, v));
+        }
+    }
+
+    let hash = hash.ok_or((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "missing hash"}))))?;
+    let auth_date = auth_date.ok_or((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "missing auth_date"}))))?;
+    let user_json = user_json.ok_or((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "missing user"}))))?;
+
+    // Check freshness (24 hours)
+    let now = chrono::Utc::now().timestamp();
+    if (now - auth_date).abs() > 86400 {
+        tracing::warn!("telegram_auth: stale auth_date (age={}s)", now - auth_date);
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "auth expired"}))));
+    }
+
+    // Build data-check-string: sort by key, join as key=value lines
+    data_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let data_check_string = data_pairs.iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // secret_key = HMAC_SHA256(key="WebAppData", message=bot_token)
+    let mut mac = HmacSha256::new_from_slice(b"WebAppData")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("hmac init: {}", e)}))))?;
+    mac.update(bot_token.as_bytes());
+    let secret_key = mac.finalize().into_bytes();
+
+    // calculated_hash = HMAC_SHA256(key=secret_key, message=data_check_string)
+    let mut mac2 = HmacSha256::new_from_slice(&secret_key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("hmac2 init: {}", e)}))))?;
+    mac2.update(data_check_string.as_bytes());
+    let calculated = mac2.finalize().into_bytes();
+    let calculated_hex = hex::encode(calculated);
+
+    if calculated_hex != hash {
+        tracing::warn!("telegram_auth: hash mismatch (calc_prefix={}, recv_prefix={})", &calculated_hex[..16], &hash[..16.min(hash.len())]);
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid hash"}))));
+    }
+
+    // Parse user JSON
+    let user: serde_json::Value = serde_json::from_str(&user_json)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": format!("user parse: {}", e)}))))?;
+    let telegram_id = user.get("id").and_then(|v| v.as_i64())
+        .ok_or((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "missing user.id"}))))?;
+    let telegram_handle = user.get("username").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let telegram_first_name = user.get("first_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    tracing::info!("telegram_auth: verified telegram_id={} handle={:?}", telegram_id, telegram_handle);
+
+    // Look up existing wallet
+    let row = sqlx::query("SELECT u.username, w.wallet_address FROM ubtc_users u JOIN ubtc_wallets w ON w.user_id = u.id WHERE u.telegram_id = $1 LIMIT 1")
+        .bind(telegram_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+
+    if let Some(r) = row {
+        use sqlx::Row;
+        Ok(Json(TelegramAuthResponse {
+            linked: true,
+            wallet_address: Some(r.get("wallet_address")),
+            username: r.get("username"),
+            telegram_id,
+            telegram_handle,
+            telegram_first_name,
+        }))
+    } else {
+        Ok(Json(TelegramAuthResponse {
+            linked: false,
+            wallet_address: None,
+            username: None,
+            telegram_id,
+            telegram_handle,
+            telegram_first_name,
+        }))
+    }
+}
+
+
 
 async fn create_wallet(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
@@ -2531,10 +2682,21 @@ async fn create_wallet(
     let wallet_name = req.wallet_name.unwrap_or_else(|| "My Wallet".to_string());
     let linked_vault_id = req.linked_vault_id.unwrap_or_default();
 
-    sqlx::query("INSERT INTO ubtc_users (id, username, email, wallet_address, created_at) VALUES ($1, $2, $3, $4, NOW())")
+  sqlx::query("INSERT INTO ubtc_users (id, username, email, wallet_address, created_at) VALUES ($1, $2, $3, $4, NOW())")
         .bind(&user_id).bind(&req.username).bind(&req.email).bind(&wallet_address)
         .execute(&pool).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+
+    // Link Telegram identity if provided
+    if let Some(tg_id) = req.telegram_id {
+        sqlx::query("UPDATE ubtc_users SET telegram_id = $1, telegram_handle = $2 WHERE id = $3")
+            .bind(tg_id)
+            .bind(&req.telegram_handle)
+            .bind(&user_id)
+            .execute(&pool).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("telegram link failed: {}", e)}))))?;
+        tracing::info!("create_wallet: linked telegram_id={} handle={:?} to user {}", tg_id, req.telegram_handle, user_id);
+    }
     sqlx::query("INSERT INTO ubtc_wallets (id, user_id, balance, public_key, sphincs_pk, kyber_pk, wallet_address, wallet_name, linked_vault_id, created_at, updated_at) VALUES ($1, $2, '0', $3, $4, $5, $6, $7, $8, NOW(), NOW())")
         .bind(&wallet_id).bind(&user_id)
         .bind(&req.dilithium_pk).bind(&req.sphincs_pk).bind(&req.kyber_pk)
