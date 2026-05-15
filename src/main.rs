@@ -2648,6 +2648,31 @@ async fn telegram_auth(
             telegram_first_name,
         }))
     } else {
+        // First-time user — send a one-time welcome message.
+        // Fire-and-forget; auth response must not depend on Telegram message delivery.
+        let welcome_handle = telegram_handle.clone();
+        let welcome_first_name = telegram_first_name.clone();
+        tokio::spawn(async move {
+            let greeting = match (welcome_handle.as_ref(), welcome_first_name.as_ref()) {
+                (Some(h), _) if !h.is_empty() => format!("@{}", h),
+                (_, Some(n)) if !n.is_empty() => n.clone(),
+                _ => "there".to_string(),
+            };
+            let text = format!(
+                "Welcome to UBTC, {} 👋\n\n\
+                UBTC is a quantum-secured stablecoin backed by Bitcoin. You hold the keys — we never touch them. Every operation is authorized with post-quantum cryptography, designed to be safe against future quantum computers.\n\n\
+                To get started:\n\
+                • Open your wallet\n\
+                • Open a self-custody account\n\
+                • Deposit Bitcoin → mint UBTC
+				• Send → Recieve UBTC
+				• Redeem UBTC → to BTC",
+                greeting
+            );
+            let app_url = std::env::var("TELEGRAM_MINI_APP_URL")
+                .unwrap_or_else(|_| "https://ubtc-frontend-coral.vercel.app/dashboard".to_string());
+            send_telegram_message(telegram_id, text, Some(app_url)).await;
+        });
         Ok(Json(TelegramAuthResponse {
             linked: false,
             wallet_address: None,
@@ -2956,8 +2981,13 @@ async fn send_from_wallet(
 
     let tx_id = format!("wtx_{}", &Uuid::new_v4().to_string()[..8]);
     let new_sender_balance = sender_balance_dec - amount;
-    if req.send_type == "internal" {
-        let recipient = sqlx::query("SELECT w.id, w.balance, w.user_id, u.username FROM ubtc_wallets w JOIN ubtc_users u ON w.user_id = u.id WHERE u.username = $1 OR w.wallet_address = $1").bind(&req.to_username_or_address).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"recipient not found"}))))?;
+   if req.send_type == "internal" {
+        let recipient = sqlx::query("SELECT w.id, w.balance, w.user_id, w.wallet_address, u.username FROM ubtc_wallets w JOIN ubtc_users u ON w.user_id = u.id WHERE u.username = $1 OR w.wallet_address = $1").bind(&req.to_username_or_address).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"recipient not found"}))))?;
+        // Reject self-sends — no economic meaning, and they create accounting edge cases.
+        let recipient_wallet_address_check: String = recipient.get("wallet_address");
+        if recipient_wallet_address_check == req.from_address {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Cannot send UBTC to yourself"}))));
+        }
         let recipient_wallet_id: String = recipient.get("id");
         let recipient_balance: String = recipient.get("balance");
         let recipient_username: String = recipient.get("username");
