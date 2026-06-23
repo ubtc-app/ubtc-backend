@@ -25,6 +25,8 @@ totp-rs = { version = "5", features = ["gen_secret"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 fips204 = "0.4"
+fips205 = "0.4"
+aes-gcm = "0.10"
 pqcrypto-sphincsplus = "0.7"
 pqcrypto-traits = "0.3"
 base64 = "0.21"

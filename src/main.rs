@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     routing::{get, post},
     Router, Json,
     http::StatusCode,
@@ -35,14 +35,14 @@ fn quantum_sign(secret_key_b64: &str, message: &[u8]) -> Option<String> {
     let sig = ubtc_protocol::sign_state(message, &sk_bytes, &[]).ok()?;
     Some(base64::encode(&sig.dilithium_sig))
 }
-fn quantum_verify(public_key_b64: &str, message: &[u8], signature_b64: &str) -> bool {
+fn quantum_verify(public_key_hex: &str, message: &[u8], signature_hex: &str) -> bool {
     use fips204::ml_dsa_65;
     use fips204::traits::{SerDes, Verifier};
-    let pk_bytes = match hex::decode(public_key_b64) {
+    let pk_bytes = match hex::decode(public_key_hex) {
         Ok(b) => b,
-        Err(_) => match base64::decode(public_key_b64) { Ok(b) => b, Err(_) => return false },
+        Err(_) => match base64::decode(public_key_hex) { Ok(b) => b, Err(_) => return false },
     };
-    let sig_bytes = match base64::decode(signature_b64) { Ok(b) => b, Err(_) => return false };
+    let sig_bytes = match hex::decode(signature_hex) { Ok(b) => b, Err(_) => return false };
     if pk_bytes.len() != ml_dsa_65::PK_LEN { return false; }
     if sig_bytes.len() != ml_dsa_65::SIG_LEN { return false; }
     let mut pk_arr = [0u8; ml_dsa_65::PK_LEN];
@@ -159,7 +159,7 @@ async fn issue_challenge(
 /// post-quantum hardness assumptions. This is the strongest practical PQ
 /// posture for application-layer signatures today.
 ///
-/// `dilithium_sig_b64` is the ML-DSA-65 signature, base64.
+/// `dilithium_sig_hex` is the ML-DSA-65 signature, hex.
 /// `sphincs_sig_hex`   is the SPHINCS+ signed-message, hex.
 async fn verify_quantum_challenge(
     pool: &sqlx::PgPool,
@@ -167,7 +167,7 @@ async fn verify_quantum_challenge(
     wallet_address: &str,
     operation: &str,
     params: &str,
-    dilithium_sig_b64: &str,
+    dilithium_sig_hex: &str,
     sphincs_sig_hex: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     use sqlx::Row;
@@ -244,21 +244,49 @@ async fn verify_quantum_challenge(
     let signed_payload = format!("{}:{}:{}", operation, params, nonce);
 
     // 1. ML-DSA-65 (lattice).
-    if !quantum_verify(&dilithium_pk_b64, signed_payload.as_bytes(), dilithium_sig_b64) {
+    if !quantum_verify(&dilithium_pk_b64, signed_payload.as_bytes(), dilithium_sig_hex) {
         return Err(err(
             StatusCode::UNAUTHORIZED,
             "invalid ML-DSA-65 signature",
         ));
     }
 
-   // 2. SPHINCS+ verification - TEMPORARILY DISABLED (Stage 2 milestone).
-    // Frontend uses @noble/post-quantum which implements FIPS 205 SLH-DSA;
-    // backend uses pqcrypto-sphincsplus 0.6.4 which implements Round 3 SPHINCS+.
-    // The two are byte-incompatible despite identical key/signature sizes.
-    // TODO: Switch backend to fips205 crate or frontend to a Round 3 JS lib.
-    // ML-DSA-65 (lattice) signature above provides full PQ authentication for now.
-    let _ = sphincs_pk_hex;
-    let _ = sphincs_sig_hex;
+    // 2. SLH-DSA-SHAKE-256s (FIPS 205) — hash-based, second independent PQ family.
+    // Frontend signs with @noble/post-quantum (FIPS 205). Backend verifies with fips205 crate.
+    // Both implement FIPS 205 SLH-DSA-SHAKE-256s: PK = 64 bytes, sig = 49,856 bytes.
+    {
+        use fips205::slh_dsa_shake_256s;
+        use fips205::traits::{SerDes, Verifier};
+
+        let sphincs_pk_bytes = match hex::decode(&sphincs_pk_hex) {
+            Ok(b) => b,
+            Err(_) => return Err(err(StatusCode::UNAUTHORIZED, "invalid SLH-DSA public key encoding")),
+        };
+        if sphincs_pk_bytes.len() != slh_dsa_shake_256s::PK_LEN {
+            return Err(err(StatusCode::UNAUTHORIZED,
+                "SLH-DSA public key wrong length — wallet may need re-registration"));
+        }
+        let mut pk_arr = [0u8; slh_dsa_shake_256s::PK_LEN];
+        pk_arr.copy_from_slice(&sphincs_pk_bytes);
+        let sphincs_pk = match slh_dsa_shake_256s::PublicKey::try_from_bytes(&pk_arr) {
+            Ok(k) => k,
+            Err(_) => return Err(err(StatusCode::UNAUTHORIZED, "invalid SLH-DSA public key")),
+        };
+
+        let sphincs_sig_bytes = match hex::decode(sphincs_sig_hex) {
+            Ok(b) => b,
+            Err(_) => return Err(err(StatusCode::UNAUTHORIZED, "invalid SLH-DSA signature encoding")),
+        };
+        if sphincs_sig_bytes.len() != slh_dsa_shake_256s::SIG_LEN {
+            return Err(err(StatusCode::UNAUTHORIZED, "SLH-DSA signature wrong length"));
+        }
+        let mut sig_arr = [0u8; slh_dsa_shake_256s::SIG_LEN];
+        sig_arr.copy_from_slice(&sphincs_sig_bytes);
+
+        if !sphincs_pk.verify(signed_payload.as_bytes(), &sig_arr, &[]) {
+            return Err(err(StatusCode::UNAUTHORIZED, "invalid SLH-DSA-SHAKE-256s signature"));
+        }
+    }
     let consumed_now = sqlx::query(
         "UPDATE challenges SET consumed = true WHERE id = $1 AND consumed = false",
     )
@@ -620,6 +648,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ubtc/mint-proof", post(mint_ubtc_proof))
         .route("/ubtc/co-sign", post(cosign_transfer))
         .route("/ubtc/nullifier/spend", post(spend_nullifier))
+        .route("/ubtc/nullifier/batch-anchor", post(nullifier_batch_anchor))
         .route("/ubtc/nullifier/:hex", get(check_nullifier))
       .route("/ubtc/redeem-proof", post(redeem_proof))
         .route("/ubtc/redeem", post(redeem_ubtc))
@@ -1767,76 +1796,93 @@ async fn lnurl_fetch_invoice(lightning_address: &str, amount_msats: i64) -> Resu
     inv["pr"].as_str().map(|s| s.to_string()).ok_or("No invoice in response".to_string())
 }
 
-// Real Kyber1024 KEM encryption of proof taproot key
-// Returns: hex(kyber_ciphertext) + ":" + hex(nonce) + ":" + hex(encrypted_data) + ":" + hex(auth_tag)
+// ML-KEM-1024 (FIPS 203) + AES-256-GCM encryption of proof taproot key.
+// Format: "v2:hex(kem_ct):hex(nonce_12):hex(aes_gcm_ct_with_16byte_tag)"
 fn kyber_encrypt_for_recipient(plaintext: &[u8], recipient_kyber_pk_hex: &str) -> Result<String, String> {
-    // Real Kyber1024 pk is 1568 bytes = 3136 hex chars
+    // ML-KEM-1024 pk is 1568 bytes = 3136 hex chars
     // Old fake keys are 32 bytes = 64 hex chars Ã¢â‚¬â€ fall back to XOR for those
     if recipient_kyber_pk_hex.len() < 3136 {
         return Err("Not a real Kyber1024 key Ã¢â‚¬â€ use new account".to_string());
     }
     use pqcrypto_mlkem::mlkem1024;
     use pqcrypto_traits::kem::{PublicKey as KemPk, Ciphertext as KemCt, SharedSecret as KemSs};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use aes_gcm::aead::{Aead, KeyInit};
     use sha2::{Sha256, Digest};
     use rand::RngCore;
     let pk_bytes = hex::decode(recipient_kyber_pk_hex).map_err(|e| e.to_string())?;
-    let pk = mlkem1024::PublicKey::from_bytes(&pk_bytes).map_err(|e| format!("Invalid Kyber pk: {:?}", e))?;
+    let pk = mlkem1024::PublicKey::from_bytes(&pk_bytes).map_err(|e| format!("Invalid ML-KEM-1024 pk: {:?}", e))?;
     // KEM encapsulate Ã¢â‚¬â€ produces shared secret + ciphertext
     let (shared_secret, kem_ciphertext) = mlkem1024::encapsulate(&pk);
     // Derive AES key from shared secret via SHA256
     let mut hasher = Sha256::new();
     hasher.update(shared_secret.as_bytes());
     hasher.update(b"UBTC_KYBER_AES_KEY_V1");
-    let aes_key = hasher.finalize();
-    // XOR-stream encrypt with SHA3 keystream (AES-GCM would need extra crate)
-    let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let mut stream = Vec::new();
-    let mut counter = 0u64;
-    while stream.len() < plaintext.len() {
-        let mut h = sha2::Sha256::new();
-        h.update(&aes_key);
-        h.update(&nonce);
-        h.update(&counter.to_le_bytes());
-        stream.extend_from_slice(&h.finalize());
-        counter += 1;
-    }
-    let ciphertext: Vec<u8> = plaintext.iter().zip(stream.iter()).map(|(a, b)| a ^ b).collect();
-    // Auth tag = SHA256(kem_ciphertext || nonce || ciphertext || aes_key)
-    let mut auth_hasher = sha2::Sha256::new();
-    auth_hasher.update(kem_ciphertext.as_bytes());
-    auth_hasher.update(&nonce);
-    auth_hasher.update(&ciphertext);
-    auth_hasher.update(&aes_key);
-    let auth_tag = auth_hasher.finalize();
-    Ok(format!("{}:{}:{}:{}",
+    let aes_key_bytes = hasher.finalize();
+    let key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    // AES-256-GCM: output is ciphertext || 16-byte AEAD auth tag
+    let aes_gcm_output = cipher.encrypt(nonce, plaintext)
+        .map_err(|e| format!("AES-256-GCM encryption failed: {}", e))?;
+    Ok(format!("v2:{}:{}:{}",
         hex::encode(kem_ciphertext.as_bytes()),
-        hex::encode(&nonce),
-        hex::encode(&ciphertext),
-        hex::encode(&auth_tag)
+        hex::encode(&nonce_bytes),
+        hex::encode(&aes_gcm_output),
     ))
 }
 
-// Decrypt Kyber1024 encrypted proof key with recipient's secret key
+// Decrypt an ML-KEM-1024 + AES-256-GCM encrypted proof key.
+// Supports two formats for backward compatibility:
+//   v2 (current):  "v2:hex(kem_ct):hex(nonce):hex(aes_gcm_ct)"
+//   legacy:        "hex(kem_ct):hex(nonce):hex(xor_ct):hex(sha256_tag)"
 fn kyber_decrypt_proof_key(encrypted: &str, recipient_kyber_sk_hex: &str) -> Result<Vec<u8>, String> {
     use pqcrypto_mlkem::mlkem1024;
     use pqcrypto_traits::kem::{SecretKey as KemSk, Ciphertext as KemCt, SharedSecret as KemSs};
     use sha2::{Sha256, Digest};
+
+    let sk_bytes = hex::decode(recipient_kyber_sk_hex).map_err(|e| e.to_string())?;
+    let sk = mlkem1024::SecretKey::from_bytes(&sk_bytes).map_err(|e| format!("Invalid ML-KEM-1024 sk: {:?}", e))?;
+
+    // Detect format by first token
+    let parts: Vec<&str> = encrypted.splitn(4, ':').collect();
+    if parts.len() == 4 && parts[0] == "v2" {
+        // Current AES-256-GCM format
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use aes_gcm::aead::{Aead, KeyInit};
+        let kem_ct_bytes = hex::decode(parts[1]).map_err(|e| e.to_string())?;
+        let nonce_bytes = hex::decode(parts[2]).map_err(|e| e.to_string())?;
+        let aes_gcm_ct = hex::decode(parts[3]).map_err(|e| e.to_string())?;
+        let kem_ct = mlkem1024::Ciphertext::from_bytes(&kem_ct_bytes).map_err(|e| format!("Invalid ML-KEM-1024 ct: {:?}", e))?;
+        let shared_secret = mlkem1024::decapsulate(&kem_ct, &sk);
+        let mut h = Sha256::new();
+        h.update(shared_secret.as_bytes());
+        h.update(b"UBTC_KYBER_AES_KEY_V1");
+        let aes_key_bytes = h.finalize();
+        let key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        if nonce_bytes.len() != 12 { return Err("Invalid nonce length".to_string()); }
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        return cipher.decrypt(nonce, aes_gcm_ct.as_ref())
+            .map_err(|_| "AES-256-GCM decryption failed — wrong key or corrupted proof".to_string());
+    }
+
+    // Legacy SHA256-XOR format: "kem_ct:nonce:xor_ct:sha256_tag"
     let parts: Vec<&str> = encrypted.split(':').collect();
     if parts.len() != 4 { return Err("Invalid encrypted format".to_string()); }
     let kem_ct_bytes = hex::decode(parts[0]).map_err(|e| e.to_string())?;
     let nonce = hex::decode(parts[1]).map_err(|e| e.to_string())?;
     let ciphertext = hex::decode(parts[2]).map_err(|e| e.to_string())?;
     let auth_tag = hex::decode(parts[3]).map_err(|e| e.to_string())?;
-    let sk_bytes = hex::decode(recipient_kyber_sk_hex).map_err(|e| e.to_string())?;
-    let sk = mlkem1024::SecretKey::from_bytes(&sk_bytes).map_err(|e| format!("Invalid Kyber sk: {:?}", e))?;
-    let kem_ct = mlkem1024::Ciphertext::from_bytes(&kem_ct_bytes).map_err(|e| format!("Invalid Kyber ct: {:?}", e))?;
+    let kem_ct = mlkem1024::Ciphertext::from_bytes(&kem_ct_bytes).map_err(|e| format!("Invalid ML-KEM-1024 ct: {:?}", e))?;
     let shared_secret = mlkem1024::decapsulate(&kem_ct, &sk);
     let mut hasher = Sha256::new();
     hasher.update(shared_secret.as_bytes());
     hasher.update(b"UBTC_KYBER_AES_KEY_V1");
     let aes_key = hasher.finalize();
-    // Verify auth tag
+    // Verify legacy auth tag
     let mut auth_hasher = sha2::Sha256::new();
     auth_hasher.update(&kem_ct_bytes);
     auth_hasher.update(&nonce);
@@ -2669,9 +2715,7 @@ async fn telegram_auth(
 				• Redeem UBTC → to BTC",
                 greeting
             );
-            let app_url = std::env::var("TELEGRAM_MINI_APP_URL")
-                .unwrap_or_else(|_| "https://ubtc-frontend-coral.vercel.app/dashboard".to_string());
-            send_telegram_message(telegram_id, text, Some(app_url)).await;
+            send_telegram_message(telegram_id, text, None).await;
         });
         Ok(Json(TelegramAuthResponse {
             linked: false,
@@ -3507,20 +3551,211 @@ async fn mint_ubtc_proof(
 }
 
 async fn cosign_transfer(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let nullifier = req["spent_nullifier"].as_str().ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"spent_nullifier required"}))))?;
-    let recipient_pk = req["recipient_dilithium_pk"].as_str().ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"recipient_dilithium_pk required"}))))?;
+    use ubtc_protocol::dleq::DLEQProof;
+
+    let err = |msg: &str| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+    let server_err = |msg: String| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": msg})));
+
+    // 1. Hybrid PQ authentication
+    let wallet_address = req["wallet_address"].as_str().ok_or_else(|| err("wallet_address required"))?;
+    let challenge_id   = req["challenge_id"].as_str().ok_or_else(|| err("challenge_id required"))?;
+    let signature      = req["signature"].as_str().ok_or_else(|| err("signature (ML-DSA-65) required"))?;
+    let sphincs_sig    = req["sphincs_signature"].as_str().ok_or_else(|| err("sphincs_signature required"))?;
+    let nullifier_hex  = req["spent_nullifier_hex"].as_str().ok_or_else(|| err("spent_nullifier_hex required"))?;
+
+    verify_quantum_challenge(
+        &pool, challenge_id, wallet_address,
+        "cosign_transfer", nullifier_hex,
+        signature, sphincs_sig,
+    ).await?;
+
+    // 2. Parse and verify DLEQ proof
+    let proof_obj = req.get("dleq_proof").ok_or_else(|| err("dleq_proof required"))?;
+
+    let hex_field = |field: &str| -> Result<Vec<u8>, _> {
+        proof_obj[field].as_str()
+            .ok_or_else(|| err("dleq_proof field missing"))
+            .and_then(|s| hex::decode(s).map_err(|_| err("dleq_proof hex invalid")))
+    };
+
+    let dleq = DLEQProof {
+        challenge:    hex_field("challenge")?,
+        response:     hex_field("response")?,
+        commitment_1: hex_field("commitment_1")?,
+        commitment_2: hex_field("commitment_2")?,
+    };
+
+    if !dleq.verify() {
+        return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "DLEQ proof verification failed",
+            "detail": "The discrete log equivalence proof is invalid. WLB cannot co-sign."
+        }))));
+    }
+    tracing::info!("DLEQ proof verified for nullifier {}...", &nullifier_hex[..nullifier_hex.len().min(16)]);
+
+    // 3. Double-spend check
+    let already_spent: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM nullifiers WHERE nullifier_hex = $1 LIMIT 1"
+    )
+    .bind(nullifier_hex)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| server_err(format!("DB error: {}", e)))?;
+
+    if already_spent.is_some() {
+        return Err((StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "Nullifier already spent — double spend blocked"
+        }))));
+    }
+
+    // 4. Atomically record: nullifier spent + cosign record
     let cosign_id = format!("cosign_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    tracing::info!("Co-signed transfer Ã¢â‚¬â€ nullifier: {} recipient: {}...", &nullifier[..8], &recipient_pk[..8.min(recipient_pk.len())]);
+    let recipient_pk  = req["recipient_dilithium_pk"].as_str().unwrap_or("");
+    let recipient_kpk = req["recipient_kyber_pk"].as_str().unwrap_or("");
+    let amount_sats   = req["amount_sats"].as_u64().unwrap_or(0);
+
+    sqlx::query(
+        "INSERT INTO nullifiers (id, nullifier_hex, spent_at) VALUES ($1, $2, NOW()) ON CONFLICT DO NOTHING"
+    )
+    .bind(format!("null_{}", &uuid::Uuid::new_v4().to_string()[..8]))
+    .bind(nullifier_hex)
+    .execute(&pool)
+    .await
+    .map_err(|e| server_err(format!("Nullifier insert failed: {}", e)))?;
+
+    // Optional audit log (table may not exist in all deployments)
+    let _ = sqlx::query(
+        "INSERT INTO cosign_records (id, nullifier_hex, recipient_dilithium_pk, recipient_kyber_pk, \
+         amount_sats, dleq_commitment_1, dleq_commitment_2, created_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT DO NOTHING"
+    )
+    .bind(&cosign_id)
+    .bind(nullifier_hex)
+    .bind(recipient_pk)
+    .bind(recipient_kpk)
+    .bind(amount_sats as i64)
+    .bind(hex::encode(&dleq.commitment_1))
+    .bind(hex::encode(&dleq.commitment_2))
+    .execute(&pool)
+    .await;
+
+    // 5. WLB attestation (requires WLB_DILITHIUM_SK_HEX env var in production)
+    let wlb_attestation = build_wlb_attestation(&cosign_id, nullifier_hex, amount_sats);
+
+    tracing::info!("Co-sign {} approved, DLEQ verified, nullifier marked spent", cosign_id);
+
     Ok(Json(serde_json::json!({
         "cosign_id": cosign_id,
         "status": "approved",
-        "spent_nullifier": nullifier,
-        "message": "Transfer co-signed. Post the nullifier to Bitcoin to complete."
+        "spent_nullifier_hex": nullifier_hex,
+        "dleq_verified": true,
+        "wlb_attestation": wlb_attestation,
+        "message": "Transfer co-signed. DLEQ proof verified. Broadcast the new adaptor transaction."
     })))
 }
 
+/// HMAC-SHA256 attestation over cosign responses (PQ-safe: Grover → 128-bit security).
+/// Requires WLB_ATTESTATION_KEY_HEX (any length ≥32 bytes, hex-encoded) in env.
+/// In production this key lives in a hardware HSM or sealed vault secret.
+fn build_wlb_attestation(cosign_id: &str, nullifier_hex: &str, amount_sats: u64) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let key_hex = std::env::var("WLB_ATTESTATION_KEY_HEX").ok()?;
+    let key_bytes = hex::decode(&key_hex).ok()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key_bytes).ok()?;
+    let payload = format!("WLB_COSIGN_V1:{}:{}:{}", cosign_id, nullifier_hex, amount_sats);
+    mac.update(payload.as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
+/// POST /ubtc/nullifier/batch-anchor
+///
+/// Collects unanchored nullifiers, computes SHA3-256 Merkle root, and posts
+/// a 39-byte OP_RETURN transaction to Bitcoin: "UBTCN1:" + merkle_root.
+/// Marks anchored nullifiers with the resulting txid.
+async fn nullifier_batch_anchor(
+    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use ubtc_protocol::nullifier::{Nullifier, NullifierBatch};
+
+    let server_err = |msg: String| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": msg})));
+
+    let nullifier_hexes: Vec<String> = if let Some(arr) = req["nullifier_hexes"].as_array() {
+        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT nullifier_hex FROM nullifiers WHERE bitcoin_txid IS NULL ORDER BY spent_at LIMIT 200"
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| server_err(format!("DB query failed: {}", e)))?
+    };
+
+    if nullifier_hexes.is_empty() {
+        return Ok(Json(serde_json::json!({"status":"nothing_to_anchor","count":0})));
+    }
+
+    let null_arrays: Vec<[u8; 32]> = nullifier_hexes.iter()
+        .filter_map(|h| hex::decode(h).ok())
+        .filter(|b| b.len() == 32)
+        .map(|b| { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr })
+        .collect();
+
+    if null_arrays.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"No valid 32-byte nullifier hashes"}))));
+    }
+
+    let merkle_root = NullifierBatch::compute_merkle_root(&null_arrays);
+    let batch = NullifierBatch { nullifiers: null_arrays, merkle_root, bitcoin_txid: None };
+
+    let payload_hex = hex::encode(batch.op_return_payload());
+    tracing::info!("Anchoring {} nullifiers, Merkle root: {}", batch.nullifiers.len(), hex::encode(&merkle_root));
+
+    let (rpc_url, rpc_user, rpc_pass) = get_rpc();
+    let client = reqwest::Client::new();
+
+    let create_data = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+        .json(&serde_json::json!({"jsonrpc":"1.0","method":"createrawtransaction","params":[[],{"data": payload_hex}]}))
+        .send().await.map_err(|e| server_err(format!("Bitcoin RPC: {}", e)))?
+        .json::<serde_json::Value>().await.map_err(|e| server_err(format!("RPC parse: {}", e)))?;
+    let raw_tx = create_data["result"].as_str().ok_or_else(|| server_err("createrawtransaction failed".to_string()))?;
+
+    let fund_data = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+        .json(&serde_json::json!({"jsonrpc":"1.0","method":"fundrawtransaction","params":[raw_tx]}))
+        .send().await.map_err(|e| server_err(format!("fundrawtransaction: {}", e)))?
+        .json::<serde_json::Value>().await.map_err(|e| server_err(format!("fund parse: {}", e)))?;
+    let funded_hex = fund_data["result"]["hex"].as_str().ok_or_else(|| server_err("fundrawtransaction: no hex".to_string()))?;
+
+    let sign_data = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+        .json(&serde_json::json!({"jsonrpc":"1.0","method":"signrawtransactionwithwallet","params":[funded_hex]}))
+        .send().await.map_err(|e| server_err(format!("signrawtransaction: {}", e)))?
+        .json::<serde_json::Value>().await.map_err(|e| server_err(format!("sign parse: {}", e)))?;
+    let signed_hex = sign_data["result"]["hex"].as_str().ok_or_else(|| server_err("sign: no hex".to_string()))?;
+
+    let send_data = client.post(&rpc_url).basic_auth(&rpc_user, Some(&rpc_pass))
+        .json(&serde_json::json!({"jsonrpc":"1.0","method":"sendrawtransaction","params":[signed_hex]}))
+        .send().await.map_err(|e| server_err(format!("sendrawtransaction: {}", e)))?
+        .json::<serde_json::Value>().await.map_err(|e| server_err(format!("send parse: {}", e)))?;
+    let bitcoin_txid = send_data["result"].as_str().ok_or_else(|| server_err("sendrawtransaction: no txid".to_string()))?;
+
+    for h in &nullifier_hexes {
+        let _ = sqlx::query(
+            "UPDATE nullifiers SET bitcoin_txid = $1, anchored_at = NOW() WHERE nullifier_hex = $2"
+        ).bind(bitcoin_txid).bind(h).execute(&pool).await;
+    }
+
+    tracing::info!("Batch anchored to Bitcoin txid: {}", bitcoin_txid);
+    Ok(Json(serde_json::json!({
+        "status": "anchored",
+        "bitcoin_txid": bitcoin_txid,
+        "nullifier_count": batch.nullifiers.len(),
+        "merkle_root": hex::encode(&merkle_root)
+    })))
+}
 async fn spend_nullifier(
     axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
     Json(req): Json<serde_json::Value>,
