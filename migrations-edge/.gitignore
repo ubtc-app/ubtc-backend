@@ -1,0 +1,8 @@
+# Operator artifacts that MUST NEVER be committed.
+# These files contain the canonical list of bait identifiers seeded into the
+# edge replica DB. They are produced by exporting `seeded_identifiers` after
+# running 002_decoys.sql. See 002_decoys.sql for the workflow.
+watchlist.txt
+watchlist.csv
+seeded_identifiers.csv
+*.canary.txt
