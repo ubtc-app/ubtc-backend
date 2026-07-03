@@ -728,6 +728,7 @@ async fn main() -> anyhow::Result<()> {
 .route("/proofs/redeem/lightning", post(redeem_proof_lightning))
         .route("/proofs/:wallet_address", get(get_wallet_proofs))
         .route("/proofs/:proof_id/download", post(download_proof))
+        .route("/wallet/:address", get(get_wallet))
         .route("/wallet/:address/send", post(send_from_wallet))
         .route("/wallet/:address/transactions", get(get_wallet_transactions))
         .route("/ubtc/mint-proof", post(mint_ubtc_proof))
